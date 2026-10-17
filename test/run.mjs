@@ -45,8 +45,8 @@ const hostSource = readFileSync(join(root, 'index.js'), 'utf8')
 
 const hostCtx = { console, process, Buffer, setTimeout, clearTimeout }
 vm.createContext(hostCtx)
-vm.runInContext(hostSource + '\n;globalThis.__host = { TWEAKS, isEnabled, describeTweaks, checkTarget };', hostCtx)
-const { TWEAKS, isEnabled, describeTweaks, checkTarget } = hostCtx.__host
+vm.runInContext(hostSource + '\n;globalThis.__host = { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry };', hostCtx)
+const { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry } = hostCtx.__host
 
 console.log('TWEAKS registry:')
 ok('is a non-empty frozen list', Array.isArray(TWEAKS) && TWEAKS.length > 0 && Object.isFrozen(TWEAKS))
@@ -57,6 +57,34 @@ ok(
 )
 ok('hideSettingsModels is registered', TWEAKS.some((t) => t.id === 'hideSettingsModels'))
 ok('restartButton is registered', TWEAKS.some((t) => t.id === 'restartButton'))
+ok('hideBuiltinDeepseek is registered', TWEAKS.some((t) => t.id === 'hideBuiltinDeepseek'))
+
+console.log('tweaks targets:')
+check('hideSettingsModels targets the settings models page', TWEAKS.find((t) => t.id === 'hideSettingsModels').target, 'ui-settings-models')
+check('hideBuiltinDeepseek targets the built-in provider', TWEAKS.find((t) => t.id === 'hideBuiltinDeepseek').target, 'llm-deepseek')
+check('restartButton declares no target', TWEAKS.find((t) => t.id === 'restartButton').target, undefined)
+
+console.log('loader reconciliation:')
+const fakeEntry = {
+  options: { id: 'llm-deepseek' },
+  disabled: false,
+  update(next) {
+    this.options = next
+    this.disabled = next.disabled === true
+    return Promise.resolve()
+  },
+}
+const fakeLoader = { store: { 'llm-deepseek': fakeEntry }, *entries() { yield fakeEntry } }
+ok('findEntry resolves by store id', findEntry(fakeLoader, 'llm-deepseek') === fakeEntry)
+check('findEntry returns undefined for unknown id', findEntry(fakeLoader, 'nope'), undefined)
+const plan = disableEntry(fakeEntry)
+check('disableEntry remembers the previous value', plan.before, undefined)
+ok('disableEntry actually disables the entry', fakeEntry.disabled === true)
+restoreEntry(fakeEntry, plan.before)
+ok('restoreEntry re-enables the entry', fakeEntry.disabled !== true)
+const again = disableEntry(fakeEntry)
+ok('disableEntry is idempotent', again.changed === true && disableEntry(fakeEntry).changed === false)
+ok('status route injects webServer, not a phantom server service', hostSource.includes("ctx.inject(['webServer']") && !hostSource.includes("['server']"))
 
 console.log('isEnabled:')
 check('unknown config -> false', isEnabled({}, 'hideSettingsModels'), false)

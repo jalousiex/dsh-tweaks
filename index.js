@@ -11,23 +11,21 @@
  *     加一个改动 = `TWEAKS` 里加一行；启用它 = `cordis.patch.yml` 里加一行。
  *     不给任何改动做专属接线。
  *
- *  2. **改动要么 patch 配置树，要么贡献一条路由；绝不伸手进别的包的内部。**
- *     这里只用两个受支持的接缝：
- *     （a）profile 自己的条目列表 —— 这正是 `cordis.patch.yml` 的用途；
- *     （b）本插件自己前缀下的 loopback 路由。
+ *  2. **改动落到 Loader 的条目上。** 一个改动的效果就是把目标条目的
+ *     `disabled` 置为 true；这里用的是 Loader 自己提供的 `loader` 服务，
+ *     不伸手进任何插件包的内部。关闭或卸载时把原值还原。
  *
- *  3. **幂等且可逆。** 同一改动应用两次不能叠加；`disable` 必须完整撤销
- *     `enable` 做过的事（靠 `ctx.effect` 的清理回调）。
+ *  3. **幂等且可逆。** 重复应用不会叠加；`ctx.effect` 的清理回调负责还原。
  *
  *  4. **绝不阻塞启动。** 某个改动应用失败只记进状态路由然后跳过 ——
  *     应用照常启动。
  *
  *  5. **如实汇报。** `GET /dsh-tweaks/status` 对每个改动同时给出
- *     「是否启用」与「是否真的生效」，让「我开了但没反应」可查，而不是变成玄学。
+ *     「是否启用」「是否应用成功」「目标条目此刻是否真的 disabled」，
+ *     让「我开了但没反应」可查，而不是变成玄学。
  *
  * 路由（loopback，与 GUI 同源）：
- *   GET  /dsh-tweaks/status  —— 所有已知改动 + 配置 + 应用结果
- *   POST /dsh-tweaks/reload  —— 重读配置并重新应用（调试用）
+ *   GET  /dsh-tweaks/status  —— 所有已知改动 + 配置 + 生效状态
  */
 
 import z from '@deepseek-ai/schemastery'
@@ -45,7 +43,8 @@ export const ROUTE_PREFIX = '/dsh-tweaks'
  * `title`  — human label (Chinese first, since the user-facing docs are Chinese).
  * `why`    — one-line rationale, shown by `/dsh-tweaks/status` so a future
  *            reader understands *why* this tweak exists before deleting it.
- * `apply`  — `(ctx, options) => void | cleanup`, called only when enabled.
+ * `target` — the Loader entry id this tweak disables. Omitted = nothing to
+ *            disable (the client half renders something instead).
  */
 export const TWEAKS = Object.freeze([
   {
@@ -53,21 +52,17 @@ export const TWEAKS = Object.freeze([
     title: '隐藏设置里的「模型清单」页，只留「账号与余额」',
     why:
       '模型清单是 dsh-tap 网关返回的上游目录，设置里那一页只是它的只读展示；' +
-      '日常用不到却占一个设置分区。禁用它不影响 /model 下拉与模型选择。' +
-      '实现方式：把 profile 配置树里的 ui-settings-models 条目标成 disabled —— ' +
-      '这是 bundle 层（dsh-web-app/cordis.patch.yml:294）注册的条目，' +
-      'patch 按 id 定位后替换 config，正是 dsh 支持的扩展点。',
-    /**
-     * 本插件声明的目标条目。
-     *
-     * 真正让它生效的是 cordis.patch.yml 里的同 id 条目（`disabled: true`）——
-     * 本插件不改任何别人的文件，只在自己的 patch 里声明，走官方扩展点。
-     *
-     * 这里额外做两件事，避免「开了却没反应」：
-     *   ① 自检：确认目标条目真的在配置树里，不在就报错而不是静默无效；
-     *   ② 记账：把「已接管该条目」写进状态路由，便于排查。
-     */
+      '日常用不到却占一个设置分区。禁用它不影响 /model 下拉与模型选择。',
     target: 'ui-settings-models',
+  },
+  {
+    id: 'hideBuiltinDeepseek',
+    title: '隐藏内置 DeepSeek 供应商，只保留「DeepSeek 账号」',
+    why:
+      '内置 llm-deepseek 是 API key 路由，和「DeepSeek 账号」（llm-deepseek-account）' +
+      '在设置与模型下拉里并列出两组同名模型。只用账号登录时，把内置那组关掉，' +
+      '列表里就只剩「DeepSeek 账号」。',
+    target: 'llm-deepseek',
   },
   {
     id: 'restartButton',
@@ -114,7 +109,7 @@ export function describeTweaks(config, applied) {
  * tree. Pure helper so the test harness can cover it without a ctx.
  *
  * Returns `{ ok, present, reason }`. When there is no tree to inspect (bundle
- * config not reachable from this plugin) we return `ok: true, present: null`
+ * config not reachable from this plugin) we return `{ ok: true, present: null }`
  * and say so — an unverifiable target must not be reported as a failure, or
  * every status call would look broken.
  */
@@ -127,6 +122,50 @@ export function checkTarget(target, tree) {
     : { ok: false, present: false, reason: `target ${target} is not in the config tree` }
 }
 
+/** 取 Loader 服务（Cordis Loader 以 `loader` 名注册）。取不到返回 undefined。 */
+export function loaderOf(ctx) {
+  try {
+    return ctx?.get ? ctx.get('loader') : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 在 Loader 的条目树里按 id 找条目（含 group 里的嵌套条目）。 */
+export function findEntry(loader, id) {
+  if (!loader || !id) return undefined
+  const direct = loader.store && loader.store[id]
+  if (direct) return direct
+  if (typeof loader.entries === 'function') {
+    for (const entry of loader.entries()) {
+      if (entry && entry.options && entry.options.id === id) return entry
+    }
+  }
+  return undefined
+}
+
+/**
+ * 把条目收敛到「禁用」。返回 `{ before, changed }` 供回滚。
+ * 已经禁用时不动它，避免每次启动都重复 update。
+ */
+export function disableEntry(entry) {
+  const before = entry?.options ? entry.options.disabled : undefined
+  if (!entry || entry.disabled === true) return { before, changed: false }
+  const task = entry.update({ ...entry.options, disabled: true })
+  if (task && typeof task.catch === 'function') task.catch(() => {})
+  return { before, changed: true }
+}
+
+/** 回滚 `disableEntry`：把 `disabled` 还原成应用前的值。 */
+export function restoreEntry(entry, before) {
+  if (!entry || !entry.options || entry.options.disabled !== true) return
+  const next = { ...entry.options }
+  if (before === undefined) delete next.disabled
+  else next.disabled = before
+  const task = entry.update(next)
+  if (task && typeof task.catch === 'function') task.catch(() => {})
+}
+
 export function apply(ctx, config = {}) {
   /** 改动 id -> { ok, error }。`applied` 表示「enable 跑过且没抛错」。 */
   const applied = new Map()
@@ -137,15 +176,23 @@ export function apply(ctx, config = {}) {
       applied.delete(tweak.id)
       return
     }
+    if (!tweak.target) {
+      applied.set(tweak.id, { ok: true, error: null })
+      return
+    }
     try {
       // ctx.effect 注册的是可逆副作用：cordis 在卸载/禁用时会调用清理回调，
       // 这正是它能在运行时安全开关的原因。
       ctx.effect(() => {
-        if (typeof tweak.apply === 'function') tweak.apply(ctx, tweak, config)
-        // 自检：声明了 target 却在配置树里找不到对应条目的改动，
-        // 会静默无效 —— 这里把它变成显式、被记录的报错。
-        const verdict = checkTarget(tweak.target, config?.tree ?? ctx?.config?.tree)
-        if (!verdict.ok) throw new Error(verdict.reason)
+        const loader = loaderOf(ctx)
+        if (!loader) throw new Error('loader service is not available')
+        const entry = findEntry(loader, tweak.target)
+        if (!entry) throw new Error(`target ${tweak.target} is not in the loader tree`)
+        const { before } = disableEntry(entry)
+        return () => {
+          const live = loaderOf(ctx)
+          restoreEntry(live ? findEntry(live, tweak.target) : entry, before)
+        }
       }, `dsh-tweaks:${tweak.id}`)
       applied.set(tweak.id, { ok: true, error: null })
     } catch (error) {
@@ -158,18 +205,41 @@ export function apply(ctx, config = {}) {
     for (const tweak of TWEAKS) runTweak(tweak)
   }
 
+  /** 每个改动：配置值 / 是否应用成功 / 目标条目此刻是否真的禁用。 */
+  function status() {
+    const loader = loaderOf(ctx)
+    return {
+      plugin: name,
+      routePrefix: ROUTE_PREFIX,
+      tweaks: TWEAKS.map((tweak) => {
+        const entry = tweak.target ? findEntry(loader, tweak.target) : undefined
+        const state = applied.get(tweak.id)
+        return {
+          id: tweak.id,
+          title: tweak.title,
+          target: tweak.target ?? null,
+          enabled: isEnabled(config, tweak.id),
+          applied: Boolean(state && state.ok),
+          present: Boolean(entry),
+          effective: entry ? entry.disabled === true : null,
+          error: (state && state.error) || null,
+        }
+      }),
+    }
+  }
+
   applyAll()
 
   if (config.statusRoute !== false) {
-    ctx.inject?.(['server'], (server) => {
-      const status = async () => ({
-        plugin: name,
-        tweaks: describeTweaks(config, applied),
-        routePrefix: ROUTE_PREFIX,
-      })
-      server.get(`${ROUTE_PREFIX}/status`, async (_req, res) => {
-        res.json(await status())
-      })
+    ctx.inject(['webServer'], (wsctx) => {
+      wsctx.effect(() => wsctx.webServer.register({
+        kind: 'exact',
+        path: `${ROUTE_PREFIX}/status`,
+        handler: async (_request, response) => {
+          response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          response.end(JSON.stringify(status()))
+        },
+      }), 'dsh-tweaks:status-route')
     })
   }
 }
