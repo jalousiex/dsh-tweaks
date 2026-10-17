@@ -136,21 +136,21 @@ const client = def.factory(function () {
 const api = client.__internals
 
 console.log('client:')
-check('readTweaks with no doc -> restart off', api.readTweaks(null).restart, false)
+check('readTweaks with no doc -> no rows', api.readTweaks(null).rows.length, 0)
 check(
-  'readTweaks honours restartButton',
-  api.readTweaks({ tweaks: [{ id: 'restartButton', enabled: true }] }).restart,
-  true,
+  'readTweaks lists tweaks that have a target',
+  api.readTweaks({ tweaks: [{ id: 'hideBuiltinDeepseek', target: 'llm-deepseek', enabled: true }] }).rows.length,
+  1,
 )
 check(
-  'readTweaks ignores restartButton:false',
-  api.readTweaks({ tweaks: [{ id: 'restartButton', enabled: false }] }).restart,
-  false,
+  'readTweaks skips tweaks without a target',
+  api.readTweaks({ tweaks: [{ id: 'restartButton', enabled: true }] }).rows.length,
+  0,
 )
 check(
   'readTweaks ignores unknown ids',
-  api.readTweaks({ tweaks: [{ id: 'nope', enabled: true }] }).restart,
-  false,
+  api.readTweaks({ tweaks: [{ id: 'nope', target: null, enabled: true }] }).rows.length,
+  0,
 )
 
 console.log('client static discipline:')

@@ -29,6 +29,9 @@
  */
 
 import z from '@deepseek-ai/schemastery'
+import { readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
 export const name = 'dsh-tweaks'
 
@@ -122,6 +125,37 @@ export function checkTarget(target, tree) {
     : { ok: false, present: false, reason: `target ${target} is not in the config tree` }
 }
 
+/**
+ * 在 `cordis.patch.yml` 文本里把某个 tweak 的 `enabled` 改成目标值。
+ * 纯函数，便于单测；格式对不上就原样返回（调用方据此报错，不会写坏文件）。
+ */
+export function setTweakEnabledInText(text, id, enabled) {
+  const lines = String(text).split(/\r?\n/)
+  const start = lines.findIndex((l) => /^\s*-\s*id:\s*['\"]?dsh-tweaks['\"]?\s*$/.test(l))
+  if (start < 0) return text
+  let end = lines.length
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^\s*-\s*id:\s*/.test(lines[i])) { end = i; break }
+  }
+  const indentOf = (l) => (l.match(/^\s*/) || [''])[0].length
+  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, function (c) { return '\\' + c })
+  const keyRe = new RegExp('^(\\s+)' + escaped + ':\\s*$')
+  for (let i = start; i < end; i++) {
+    const m = lines[i].match(keyRe)
+    if (!m) continue
+    const keyIndent = m[1].length
+    for (let j = i + 1; j < end; j++) {
+      if (indentOf(lines[j]) <= keyIndent && lines[j].trim()) break
+      const em = lines[j].match(/^(\s+)enabled:\s*(true|false)\s*$/)
+      if (em) {
+        lines[j] = em[1] + 'enabled: ' + (enabled === true ? 'true' : 'false')
+        return lines.join('\n')
+      }
+    }
+    return text
+  }
+  return text
+}
 /** 取 Loader 服务（Cordis Loader 以 `loader` 名注册）。取不到返回 undefined。 */
 export function loaderOf(ctx) {
   try {
@@ -129,6 +163,19 @@ export function loaderOf(ctx) {
   } catch {
     return undefined
   }
+}
+
+function dshHomePath() {
+  return process.env.DSH_HOME || join(homedir(), '.dsh')
+}
+
+function readRequestBody(req) {
+  return new Promise((resolve) => {
+    let body = ''
+    req.on('data', (c) => { body += c })
+    req.on('end', () => resolve(body))
+    req.on('error', () => resolve(''))
+  })
 }
 
 /** 在 Loader 的条目树里按 id 找条目（含 group 里的嵌套条目）。 */
@@ -267,6 +314,29 @@ export function apply(ctx, config = {}) {
           response.end(JSON.stringify(status()))
         },
       }), 'dsh-tweaks:status-route')
+      // 界面开关：把 enabled 写回 ③ 的 dsh-tweaks 段。
+      // 写 ③ 而不是 ②：③ 是覆盖层，配置放在 ③ 才不会被覆盖。
+      wsctx.effect(() => wsctx.webServer.register({
+        kind: 'exact',
+        path: `${ROUTE_PREFIX}/toggle`,
+        handler: async (request, response) => {
+          try {
+            const raw = await readRequestBody(request)
+            const body = JSON.parse(raw || '{}')
+            if (!TWEAKS.some((t) => t.id === body.id)) throw new Error('unknown tweak: ' + body.id)
+            const file = join(dshHomePath(), 'cordis.patch.yml')
+            const before = readFileSync(file, 'utf8')
+            const after = setTweakEnabledInText(before, body.id, body.enabled === true)
+            if (after === before) throw new Error('tweak ' + body.id + ' 不在 ' + file + ' 的 dsh-tweaks 段里')
+            writeFileSync(file, after, 'utf8')
+            response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+            response.end(JSON.stringify({ ok: true, id: body.id, enabled: body.enabled === true, file }))
+          } catch (error) {
+            response.writeHead(400, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+            response.end(JSON.stringify({ ok: false, error: String((error && error.message) || error) }))
+          }
+        },
+      }), 'dsh-tweaks:toggle-route')
     })
   }
 }
