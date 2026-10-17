@@ -1,42 +1,40 @@
 /**
- * dsh-tweaks — host half.
+ * dsh-tweaks —— 宿主半（host half）。
  *
- * A **registry of small, individually switchable tweaks** for DeepSeek Harness.
- * The point is cross-machine replication: the tweak set lives in one YAML config
- * block, so "which small behaviours do I have switched on" travels with the
- * profile instead of being lost in a dozen scattered files.
+ * 这是一个**小改动登记处**：每个改动单独开关。目的是跨机同步 ——
+ * 开关集合集中在一个 YAML 配置块里，于是「我开了哪些小开关」
+ * 随 profile 一起走，而不是散落在十来个文件里靠记忆维持。
  *
- * Design rules (from the dsh architecture notes):
+ * 设计规则（对齐 dsh 架构说明）：
  *
- *  1. **Config is data, not code.** Every tweak is `enabled: bool` plus at most a
- *     few parameters. Adding a tweak = one row in `TWEAKS`; enabling it = one
- *     line in `cordis.patch.yml`. No tweak gets bespoke wiring.
+ *  1. **配置是数据，不是代码。** 每个改动只有 `enabled: bool` 加少量参数。
+ *     加一个改动 = `TWEAKS` 里加一行；启用它 = `cordis.patch.yml` 里加一行。
+ *     不给任何改动做专属接线。
  *
- *  2. **A tweak either patches a config tree or contributes a route; it never
- *     reaches into another package's internals.** The supported seams here are
- *     (a) the profile's own entry list, which is what `cordis.patch.yml` is for,
- *     and (b) loopback routes on this plugin's own prefix.
+ *  2. **改动要么 patch 配置树，要么贡献一条路由；绝不伸手进别的包的内部。**
+ *     这里只用两个受支持的接缝：
+ *     （a）profile 自己的条目列表 —— 这正是 `cordis.patch.yml` 的用途；
+ *     （b）本插件自己前缀下的 loopback 路由。
  *
- *  3. **Idempotent and reversible.** Applying a tweak twice must not double it,
- *     and `disable` must fully undo what `enable` did (`ctx.effect` cleanup).
+ *  3. **幂等且可逆。** 同一改动应用两次不能叠加；`disable` 必须完整撤销
+ *     `enable` 做过的事（靠 `ctx.effect` 的清理回调）。
  *
- *  4. **Never block startup.** A tweak that fails to apply is reported in the
- *     status route and skipped — the app still boots.
+ *  4. **绝不阻塞启动。** 某个改动应用失败只记进状态路由然后跳过 ——
+ *     应用照常启动。
  *
- *  5. **Honest reporting.** `GET /dsh-tweaks/status` returns, per tweak, whether
- *     it is enabled AND whether it could actually be applied, so "I turned it on
- *     but nothing happened" is diagnosable instead of mysterious.
+ *  5. **如实汇报。** `GET /dsh-tweaks/status` 对每个改动同时给出
+ *     「是否启用」与「是否真的生效」，让「我开了但没反应」可查，而不是变成玄学。
  *
- * Routes (loopback, same origin as the GUI):
- *   GET  /dsh-tweaks/status  — every known tweak + config + apply result
- *   POST /dsh-tweaks/reload  — re-read config and re-apply (debug helper)
+ * 路由（loopback，与 GUI 同源）：
+ *   GET  /dsh-tweaks/status  —— 所有已知改动 + 配置 + 应用结果
+ *   POST /dsh-tweaks/reload  —— 重读配置并重新应用（调试用）
  */
 
 import z from '@deepseek-ai/schemastery'
 
 export const name = 'dsh-tweaks'
 
-/** Route prefix; keep everything under one namespace so it is greppable. */
+/** 路由前缀；所有路由都收在同一命名空间下，便于 grep。 */
 export const ROUTE_PREFIX = '/dsh-tweaks'
 
 /**
@@ -82,23 +80,23 @@ export const TWEAKS = Object.freeze([
 ])
 
 export const Config = z.object({
-  /** Per-tweak switches. Key = tweak id; unknown keys are ignored (forward-compatible). */
+  /** 每个改动的开关。键 = 改动 id；未知键直接忽略（向前兼容）。 */
   tweaks: z.dict(z.object({
     enabled: z.boolean().default(false),
   })).default(() => ({})),
-  /** Expose the status route (default on; it is read-only and loopback). */
+  /** 是否暴露状态路由（默认开；它只读且在 loopback 上）。 */
   statusRoute: z.boolean().default(true),
-  /** Allow POST /dsh-tweaks/restart to actually restart (off by default: dangerous). */
+  /** 是否允许 POST /dsh-tweaks/restart 真的重启（默认关：危险）。 */
   allowRestart: z.boolean().default(false),
 })
 
-/** Resolve one tweak's effective enabled flag from the flat config object. */
+/** 从扁平的配置对象里解出某个改动的实际启用状态。 */
 export function isEnabled(config, id) {
   const entry = config?.tweaks?.[id]
   return entry?.enabled === true
 }
 
-/** Snapshot of every known tweak + its switch state, for the status route. */
+/** 所有已知改动及其开关状态快照，供状态路由使用。 */
 export function describeTweaks(config, applied) {
   return TWEAKS.map((t) => ({
     id: t.id,
@@ -130,7 +128,7 @@ export function checkTarget(target, tree) {
 }
 
 export function apply(ctx, config = {}) {
-  /** tweak id -> { ok, error }. `applied` means "enable ran and did not throw". */
+  /** 改动 id -> { ok, error }。`applied` 表示「enable 跑过且没抛错」。 */
   const applied = new Map()
 
   function runTweak(tweak) {
@@ -140,18 +138,18 @@ export function apply(ctx, config = {}) {
       return
     }
     try {
-      // ctx.effect registers a reversible side effect: cordis calls the cleanup
-      // on unload/disable, which is what makes this safe to toggle at runtime.
+      // ctx.effect 注册的是可逆副作用：cordis 在卸载/禁用时会调用清理回调，
+      // 这正是它能在运行时安全开关的原因。
       ctx.effect(() => {
         if (typeof tweak.apply === 'function') tweak.apply(ctx, tweak, config)
-        // Self-check: a tweak that declares a target whose entry is missing is a
-        // silent no-op — make it a loud, recorded error instead.
+        // 自检：声明了 target 却在配置树里找不到对应条目的改动，
+        // 会静默无效 —— 这里把它变成显式、被记录的报错。
         const verdict = checkTarget(tweak.target, config?.tree ?? ctx?.config?.tree)
         if (!verdict.ok) throw new Error(verdict.reason)
       }, `dsh-tweaks:${tweak.id}`)
       applied.set(tweak.id, { ok: true, error: null })
     } catch (error) {
-      // Rule 4: never block startup. Record and move on.
+      // 规则 4：绝不阻塞启动。记录下来继续。
       applied.set(tweak.id, { ok: false, error: String(error?.message ?? error) })
     }
   }
