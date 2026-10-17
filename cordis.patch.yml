@@ -1,0 +1,30 @@
+# dsh-tweaks — 一组可单独开关的小改动
+#
+# 把一个包插进 profile 的条目列表，让 cordis 加载 index.js（宿主半：读开关、
+# 应用补丁、提供 /dsh-tweaks/status），并把浏览器半 lib/client.js 交给 web
+# 模块加载器。
+#
+# 为什么需要它：跨机器同步时，「我开了哪几个小开关」以前散在各处（有的在 ③
+# cordis.patch.yml，有的只能手改配置）。现在它们集中成下面这一块 config，
+# 随 profile 走。
+#
+# 加一个新开关 = 在 index.js 的 TWEAKS 里加一行 + 在下面加一行 enabled。
+# 不需要改脚本、不需要再发明一套机制。
+
+- insert:
+    - id: dsh-tweaks
+      name: 'dsh-tweaks'
+      config:
+        # 只读状态路由，loopback 同源，默认开
+        statusRoute: true
+        # 允许 POST /dsh-tweaks/restart 真的重启宿主。默认关：
+        # 重启会中断正在跑的会话，必须由用户显式打开。
+        allowRestart: false
+        tweaks:
+          # 设置里隐藏「模型清单」页，只留「账号与余额」。
+          # 模型清单是 dsh-tap 网关的上游目录展示，不影响 /model 下拉。
+          hideSettingsModels:
+            enabled: false
+          # 一键重启入口（浏览器半渲染按钮）。默认关，因为它会中断会话。
+          restartButton:
+            enabled: false
