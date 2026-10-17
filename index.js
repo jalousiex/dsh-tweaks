@@ -188,8 +188,21 @@ export function apply(ctx, config = {}) {
         if (!loader) throw new Error('loader service is not available')
         const entry = findEntry(loader, tweak.target)
         if (!entry) throw new Error(`target ${tweak.target} is not in the loader tree`)
-        const { before } = disableEntry(entry)
+        const before = entry.options ? entry.options.disabled : undefined
+        // 应用发生在启动过程中：等 Loader 这一轮挂载跑完再动兄弟条目，
+        // 避免和它自己的激活循环互相打断。
+        let cancelled = false
+        const timer = setTimeout(() => {
+          if (cancelled) return
+          try {
+            disableEntry(entry)
+          } catch (error) {
+            applied.set(tweak.id, { ok: false, error: String(error?.message ?? error) })
+          }
+        }, 0)
         return () => {
+          cancelled = true
+          clearTimeout(timer)
           const live = loaderOf(ctx)
           restoreEntry(live ? findEntry(live, tweak.target) : entry, before)
         }
