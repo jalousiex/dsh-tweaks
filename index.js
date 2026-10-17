@@ -184,27 +184,40 @@ export function apply(ctx, config = {}) {
       // ctx.effect 注册的是可逆副作用：cordis 在卸载/禁用时会调用清理回调，
       // 这正是它能在运行时安全开关的原因。
       ctx.effect(() => {
-        const loader = loaderOf(ctx)
-        if (!loader) throw new Error('loader service is not available')
-        const entry = findEntry(loader, tweak.target)
-        if (!entry) throw new Error(`target ${tweak.target} is not in the loader tree`)
-        const before = entry.options ? entry.options.disabled : undefined
-        // 应用发生在启动过程中：等 Loader 这一轮挂载跑完再动兄弟条目，
-        // 避免和它自己的激活循环互相打断。
         let cancelled = false
-        const timer = setTimeout(() => {
+        let reasserts = 0
+        let touched = false
+        const tick = () => {
           if (cancelled) return
-          try {
-            disableEntry(entry)
-          } catch (error) {
-            applied.set(tweak.id, { ok: false, error: String(error?.message ?? error) })
+          const live = findEntry(loaderOf(ctx), tweak.target)
+          if (!live) {
+            applied.set(tweak.id, { ok: false, error: `target ${tweak.target} is not in the loader tree`, reasserts })
+            return
           }
-        }, 0)
+          if (live.disabled === true) {
+            applied.set(tweak.id, { ok: true, error: null, reasserts })
+            return
+          }
+          if (reasserts >= 10) {
+            applied.set(tweak.id, { ok: false, error: 'target flips back after disable', reasserts })
+            return
+          }
+          const result = disableEntry(live)
+          if (result.changed) {
+            reasserts += 1
+            touched = true
+          }
+          applied.set(tweak.id, { ok: true, error: null, reasserts })
+        }
+        // 应用发生在启动过程中：先让 Loader 跑完这一轮，再动兄弟条目；
+        // 之后每 3 秒对账一次，覆盖 Loader 重建条目（配置热应用/安装插件）的情形。
+        const first = setTimeout(tick, 0)
+        const interval = setInterval(tick, 3000)
         return () => {
           cancelled = true
-          clearTimeout(timer)
-          const live = loaderOf(ctx)
-          restoreEntry(live ? findEntry(live, tweak.target) : entry, before)
+          clearTimeout(first)
+          clearInterval(interval)
+          if (touched) restoreEntry(findEntry(loaderOf(ctx), tweak.target), undefined)
         }
       }, `dsh-tweaks:${tweak.id}`)
       applied.set(tweak.id, { ok: true, error: null })
@@ -235,6 +248,7 @@ export function apply(ctx, config = {}) {
           applied: Boolean(state && state.ok),
           present: Boolean(entry),
           effective: entry ? entry.disabled === true : null,
+          reasserts: (state && state.reasserts) || 0,
           error: (state && state.error) || null,
         }
       }),
