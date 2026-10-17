@@ -25,6 +25,11 @@
           # 模型清单是 dsh-tap 网关的上游目录展示，不影响 /model 下拉。
           hideSettingsModels:
             enabled: false
+          # 把目录里已知不可路由的死模型（glm-4.6v / kimi-k2-thinking /
+          # minimax-m2.5 / hy4-preview-x）从选择器与设置卡列表里剔掉。
+          # 走 dsh-tap 自己的 /dsh-tap/settings 路由，不写它的文件。
+          hideUnroutableModels:
+            enabled: false
           # 一键重启入口（浏览器半渲染按钮）。默认关，因为它会中断会话。
           restartButton:
             enabled: false

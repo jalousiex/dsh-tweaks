@@ -29,9 +29,9 @@
  */
 
 import z from '@deepseek-ai/schemastery'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 export const name = 'dsh-tweaks'
 
@@ -66,6 +66,22 @@ export const TWEAKS = Object.freeze([
       '在设置与模型下拉里并列出两组同名模型。只用账号登录时，把内置那组关掉，' +
       '列表里就只剩「DeepSeek 账号」。',
     target: 'llm-deepseek',
+  },
+  {
+    id: 'hideUnroutableModels',
+    title: '模型清单里剔掉不可路由的死模型',
+    why:
+      '网关目录（/v3/config）里在列、但 /v2/chat/completions 恒 11102 service info not found 的条目' +
+      '（glm-4.6v / kimi-k2-thinking / minimax-m2.5 / hy4-preview-x）在 dsh-tap 里只是置灰，' +
+      '仍占着设置卡列表与对话模型选择器——选中必失败。本开关把它们从选择器里摘掉、' +
+      '设置卡里的行连空分组标题一起隐去：停用走 dsh-tap 自己的 /dsh-tap/settings 路由' +
+      '（modelSetEnabled=false，与卡片勾选同一条路径，顺带重铺宿主镜像），不写它的文件；' +
+      '开之前处于启用状态的 id 记在 ~/.dsh/.cache/dsh-tweaks/hide-unroutable.json，' +
+      '关闭时按这份清单勾回去。只在启动/开关时执行一次（不做周期对账）——' +
+      '在 dsh-tap 卡里手动勾回的条目，下次启动会被再剔一次。',
+    menu: true,
+    apply: applyHideUnroutable,
+    restore: restoreHideUnroutable,
   },
   {
     id: 'restartButton',
@@ -139,16 +155,18 @@ export function setTweakEnabledInText(text, id, enabled) {
   }
   const indentOf = (l) => (l.match(/^\s*/) || [''])[0].length
   const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, function (c) { return '\\' + c })
-  const keyRe = new RegExp('^(\\s+)' + escaped + ':\\s*$')
+  // 键、值都允许行尾注释（YAML 合法，配置里也确实这么写）——只替换布尔值，
+  // 行尾注释原样留着，否则「开关写回」会在带注释的行上失效。
+  const keyRe = new RegExp('^(\\s+)' + escaped + ':\\s*(?:#.*)?$')
   for (let i = start; i < end; i++) {
     const m = lines[i].match(keyRe)
     if (!m) continue
     const keyIndent = m[1].length
     for (let j = i + 1; j < end; j++) {
       if (indentOf(lines[j]) <= keyIndent && lines[j].trim()) break
-      const em = lines[j].match(/^(\s+)enabled:\s*(true|false)\s*$/)
+      const em = lines[j].match(/^(\s+)enabled:\s*(true|false)(\s*(?:#.*)?)$/)
       if (em) {
-        lines[j] = em[1] + 'enabled: ' + (enabled === true ? 'true' : 'false')
+        lines[j] = em[1] + 'enabled: ' + (enabled === true ? 'true' : 'false') + em[3]
         return lines.join('\n')
       }
     }
@@ -167,6 +185,129 @@ export function loaderOf(ctx) {
 
 function dshHomePath() {
   return process.env.DSH_HOME || join(homedir(), '.dsh')
+}
+
+// ── 数据类改动（hideUnroutableModels）的支撑 ──────────────────────────────
+// 这类开关的效果不在 Loader 条目上（为了剔几个模型把 dsh-tap 整条禁掉是不行的），
+// 而是调目标插件自己的设置路由。所以它只在 apply/restore 里做事，状态照样进
+// /dsh-tweaks/status。
+
+/** dsh-tap 设置卡自己的路由（GET 视图 / POST 动作共用同一个入口）。 */
+export const TAP_SETTINGS_ROUTE = '/dsh-tap/settings'
+
+/** 「开之前是启用的」id 清单落盘位置（.cache 不进同步盘，属本机一次性状态）。 */
+function hideUnroutableStatePath() {
+  return join(dshHomePath(), '.cache', 'dsh-tweaks', 'hide-unroutable.json')
+}
+
+/**
+ * 从 dsh-tap 的 model-list 视图里取出「目录在列、但 /v2 恒 11102」的模型 id。
+ * 纯函数（便于单测）。目录里已经消失的历史 id 不算——上游删了就没必要再动它。
+ */
+export function unroutableIds(view) {
+  const models = view && view.catalog && Array.isArray(view.catalog.models) ? view.catalog.models : []
+  const present = new Set()
+  for (const m of models) if (m && typeof m.id === 'string' && m.id) present.add(m.id)
+  const table = view && view.unroutable && typeof view.unroutable === 'object' ? view.unroutable : {}
+  return Object.keys(table).filter((id) => present.has(id))
+}
+
+function readRestoreIds(file) {
+  try {
+    const doc = JSON.parse(readFileSync(file, 'utf8'))
+    return Array.isArray(doc && doc.ids) ? doc.ids.filter((id) => typeof id === 'string' && id) : []
+  } catch {
+    return []
+  }
+}
+
+function writeRestoreIds(file, ids) {
+  if (!ids.length) return
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, JSON.stringify({ ids }, null, 2), 'utf8')
+}
+
+function clearRestoreIds(file) {
+  try { rmSync(file, { force: true }) } catch {}
+}
+
+/**
+ * POST 到 dsh-tap 的设置路由。宿主发起 = 没有 Origin 头，正好落在它
+ * 「壳转发/非浏览器放行」的语义里（它的 localGuardFailure 只要求回环 Host）。
+ * 任何非 200 / 非 JSON / ok:false 都抛错，由调用方记进状态。
+ */
+async function tapPost(origin, body) {
+  if (!origin) throw new Error('取不到本机 webServer origin')
+  const url = String(origin).replace(/\/+$/, '') + TAP_SETTINGS_ROUTE
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const text = await response.text()
+  let doc = null
+  try { doc = JSON.parse(text) } catch { doc = null }
+  if (!response.ok) {
+    throw new Error(`dsh-tap ${response.status}${doc && doc.error ? '：' + doc.error : ''}`)
+  }
+  if (!doc) throw new Error('dsh-tap 返回的不是 JSON（路由可能还没注册）')
+  if (doc.ok === false) throw new Error(String(doc.error || 'dsh-tap 拒绝了请求'))
+  return doc
+}
+
+/**
+ * hideUnroutableModels 的「开」：把目录里已知不可路由的模型逐个停用。
+ * 停用走 dsh-tap 自己的 modelSetEnabled（与卡片勾选同一条路径，它会顺带
+ * 重铺宿主镜像，选择器立刻跟上），不写它的文件。开之前处于启用状态的 id
+ * 记进还原清单，供关闭时勾回。
+ */
+export async function applyHideUnroutable({ origin, stateFile }) {
+  const view = await tapPost(origin, { action: 'model-list' })
+  const ids = unroutableIds(view)
+  const effective = new Set(Array.isArray(view.effectiveIds) ? view.effectiveIds : [])
+  const live = ids.filter((id) => effective.has(id))
+  if (live.length) {
+    const keep = readRestoreIds(stateFile)
+    for (const id of live) if (!keep.includes(id)) keep.push(id)
+    writeRestoreIds(stateFile, keep)
+    for (const id of live) {
+      await tapPost(origin, { patch: { modelSetEnabled: { id, enabled: false } } })
+    }
+  }
+  const models = view.catalog && Array.isArray(view.catalog.models) ? view.catalog.models : []
+  return { ids, disabledNow: live, catalogCount: models.length }
+}
+
+/** hideUnroutableModels 的「关」：按还原清单把当初启用的模型勾回去。 */
+export async function restoreHideUnroutable({ origin, stateFile }) {
+  const ids = readRestoreIds(stateFile)
+  if (!ids.length) return { restored: [], failed: [] }
+  const restored = []
+  const failed = []
+  for (const id of ids) {
+    try {
+      await tapPost(origin, { patch: { modelSetEnabled: { id, enabled: true } } })
+      restored.push(id)
+    } catch (error) {
+      // 目录里已经消失、且不在静态清单里的 id 会在这里失败（dsh-tap 要 profile
+      // 才能启用新增模型）——记下来继续，别让一个死 id 挡住其它还原。
+      failed.push({ id, error: String((error && error.message) || error) })
+    }
+  }
+  if (!failed.length) clearRestoreIds(stateFile)
+  return { restored, failed }
+}
+
+/** 数据类改动的结果 → 状态路由里一句人话（null = 不写）。 */
+function describeDataResult(enabled, result) {
+  if (!enabled) {
+    const restored = Array.isArray(result && result.restored) ? result.restored : []
+    const failed = Array.isArray(result && result.failed) ? result.failed : []
+    if (!restored.length && !failed.length) return '没有需要还原的条目'
+    return `还原 ${restored.length} 个${failed.length ? `（${failed.length} 个失败）` : ''}`
+  }
+  const ids = Array.isArray(result && result.disabledNow) ? result.disabledNow : []
+  return ids.length ? `已从选择器移除 ${ids.length} 个：${ids.join(', ')}` : '没有需要移除的条目'
 }
 
 function readRequestBody(req) {
@@ -217,10 +358,57 @@ export function apply(ctx, config = {}) {
   /** 改动 id -> { ok, error }。`applied` 表示「enable 跑过且没抛错」。 */
   const applied = new Map()
 
+  /**
+   * 数据类改动：效果不在 Loader 条目上，而是调目标插件自己的设置路由。
+   * 要等 webServer 起来、且兄弟插件的路由注册完，失败就短暂重试；
+   * 重试耗尽也只记状态，绝不阻塞启动（规则 4）。
+   */
+  function runDataTweak(tweak, enabled) {
+    ctx.inject(['webServer'], (wsctx) => {
+      wsctx.effect(() => {
+        let cancelled = false
+        const timers = new Set()
+        const origin = () => {
+          try { return wsctx.webServer.getOrigin() } catch { return undefined }
+        }
+        const attempt = async (left) => {
+          if (cancelled) return
+          try {
+            const result = enabled
+              ? await tweak.apply({ origin: origin(), stateFile: hideUnroutableStatePath() })
+              : await tweak.restore({ origin: origin(), stateFile: hideUnroutableStatePath() })
+            applied.set(tweak.id, { ok: true, error: null, note: describeDataResult(enabled, result) })
+          } catch (error) {
+            const message = String((error && error.message) || error)
+            if (left > 1) {
+              const timer = setTimeout(() => { timers.delete(timer); attempt(left - 1) }, 2000)
+              timers.add(timer)
+              return
+            }
+            applied.set(tweak.id, { ok: false, error: message })
+          }
+        }
+        attempt(8)
+        return () => {
+          cancelled = true
+          for (const timer of timers) clearTimeout(timer)
+          timers.clear()
+        }
+      }, `dsh-tweaks:${tweak.id}:data`)
+    })
+  }
+
   function runTweak(tweak) {
     const enabled = isEnabled(config, tweak.id)
     if (!enabled) {
       applied.delete(tweak.id)
+      // 数据类改动在关闭时也要跑一次：把开之前启用的条目还回去。
+      if (typeof tweak.restore === 'function') runDataTweak(tweak, false)
+      return
+    }
+    if (typeof tweak.apply === 'function') {
+      applied.set(tweak.id, { ok: false, error: '尚未应用（等待 dsh-tap 路由）' })
+      runDataTweak(tweak, true)
       return
     }
     if (!tweak.target) {
@@ -291,11 +479,14 @@ export function apply(ctx, config = {}) {
           id: tweak.id,
           title: tweak.title,
           target: tweak.target ?? null,
+          // 菜单里要不要给这一行：带 target 的改动天然有行；数据类改动显式声明。
+          menu: tweak.menu === true || Boolean(tweak.target),
           enabled: isEnabled(config, tweak.id),
           applied: Boolean(state && state.ok),
           present: Boolean(entry),
           effective: entry ? entry.disabled === true : null,
           reasserts: (state && state.reasserts) || 0,
+          note: (state && state.note) || null,
           error: (state && state.error) || null,
         }
       }),

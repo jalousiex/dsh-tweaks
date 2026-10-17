@@ -45,8 +45,8 @@ const hostSource = readFileSync(join(root, 'index.js'), 'utf8')
 
 const hostCtx = { console, process, Buffer, setTimeout, clearTimeout }
 vm.createContext(hostCtx)
-vm.runInContext(hostSource + '\n;globalThis.__host = { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry };', hostCtx)
-const { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry } = hostCtx.__host
+vm.runInContext(hostSource + '\n;globalThis.__host = { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, unroutableIds, TAP_SETTINGS_ROUTE, setTweakEnabledInText };', hostCtx)
+const { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, unroutableIds, TAP_SETTINGS_ROUTE, setTweakEnabledInText } = hostCtx.__host
 
 console.log('TWEAKS registry:')
 ok('is a non-empty frozen list', Array.isArray(TWEAKS) && TWEAKS.length > 0 && Object.isFrozen(TWEAKS))
@@ -58,11 +58,74 @@ ok(
 ok('hideSettingsModels is registered', TWEAKS.some((t) => t.id === 'hideSettingsModels'))
 ok('restartButton is registered', TWEAKS.some((t) => t.id === 'restartButton'))
 ok('hideBuiltinDeepseek is registered', TWEAKS.some((t) => t.id === 'hideBuiltinDeepseek'))
+ok('hideUnroutableModels is registered', TWEAKS.some((t) => t.id === 'hideUnroutableModels'))
 
 console.log('tweaks targets:')
 check('hideSettingsModels targets the settings models page', TWEAKS.find((t) => t.id === 'hideSettingsModels').target, 'ui-settings-models')
 check('hideBuiltinDeepseek targets the built-in provider', TWEAKS.find((t) => t.id === 'hideBuiltinDeepseek').target, 'llm-deepseek')
 check('restartButton declares no target', TWEAKS.find((t) => t.id === 'restartButton').target, undefined)
+const hideUnroutable = TWEAKS.find((t) => t.id === 'hideUnroutableModels')
+check('hideUnroutableModels declares no loader target', hideUnroutable.target, undefined)
+ok('hideUnroutableModels opts into the menu', hideUnroutable.menu === true)
+ok('hideUnroutableModels has a host apply', typeof hideUnroutable.apply === 'function')
+ok('hideUnroutableModels has a host restore', typeof hideUnroutable.restore === 'function')
+
+console.log('unroutableIds:')
+check('tweak route is dsh-tap settings', TAP_SETTINGS_ROUTE, '/dsh-tap/settings')
+check('no view -> empty', unroutableIds(null), [])
+check(
+  'only catalog-present ids count',
+  unroutableIds({
+    catalog: { models: [{ id: 'glm-4.6v' }, { id: 'hy4-preview' }] },
+    unroutable: { 'glm-4.6v': 'dead', 'hy4-preview-x': 'gone from catalog' },
+  }),
+  ['glm-4.6v'],
+)
+check(
+  'all present ids are listed',
+  unroutableIds({
+    catalog: { models: [{ id: 'a' }, { id: 'b' }, { id: 'c' }] },
+    unroutable: { a: 'x', b: 'y' },
+  }),
+  ['a', 'b'],
+)
+check(
+  'view without unroutable table -> empty',
+  unroutableIds({ catalog: { models: [{ id: 'a' }] } }),
+  [],
+)
+
+const patchText = [
+  '- id: dsh-tweaks',
+  '  name: "dsh-tweaks"',
+  '  config:',
+  '    tweaks:',
+  '      hideUnroutableModels:',
+  '        enabled: true        # 目录在列但不可路由',
+  '      restartButton:',
+  '        enabled: false',
+  '- id: web',
+].join('\n')
+check(
+  'toggle rewrites the boolean',
+  setTweakEnabledInText(patchText, 'hideUnroutableModels', false).includes('        enabled: false        # 目录在列但不可路由'),
+  true,
+)
+check(
+  'toggle keeps the trailing comment of the sibling it does not touch',
+  setTweakEnabledInText(patchText, 'restartButton', true).includes('        enabled: true'),
+  true,
+)
+check(
+  'toggle leaves the text alone for an unknown tweak',
+  setTweakEnabledInText(patchText, 'nope', true),
+  patchText,
+)
+check(
+  'toggle leaves the text alone without a dsh-tweaks row',
+  setTweakEnabledInText('- id: other\n  config: {}\n', 'hideUnroutableModels', true),
+  '- id: other\n  config: {}\n',
+)
 
 console.log('loader reconciliation:')
 const fakeEntry = {
@@ -152,6 +215,23 @@ check(
   api.readTweaks({ tweaks: [{ id: 'nope', target: null, enabled: true }] }).rows.length,
   0,
 )
+check(
+  'readTweaks honors the menu flag for data tweaks',
+  api.readTweaks({ tweaks: [{ id: 'hideUnroutableModels', target: null, menu: true, enabled: true }] }).rows.length,
+  1,
+)
+ok(
+  'readTweaks reports the hideUnroutable state',
+  api.readTweaks({ tweaks: [{ id: 'hideUnroutableModels', menu: true, enabled: true }] }).hideUnroutable === true,
+)
+ok(
+  'readTweaks defaults hideUnroutable to false',
+  api.readTweaks({ tweaks: [] }).hideUnroutable === false,
+)
+ok('hide CSS hides unroutable rows', api.HIDE_UNROUTABLE_CSS.includes('.cbc-listrow.cbc-unroutable{display:none!important}'))
+ok('hide CSS collapses an all-dead group title', api.HIDE_UNROUTABLE_CSS.includes('p.cbc-subtitle:not(:has('))
+ok('hide CSS is off while the tweak is off', !api.styleText().includes('cbc-unroutable'))
+ok('base CSS is always present', api.styleText().includes('.dtw-item'))
 
 console.log('client static discipline:')
 ok('does not observe class', !/attributeFilter:\s*\[\s*["']class["']/.test(clientSource))

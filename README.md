@@ -32,6 +32,8 @@
 | id | 默认 | 作用 |
 | --- | --- | --- |
 | `hideSettingsModels` | 关 | 隐藏设置里的「模型清单」页，只留「账号与余额」 |
+| `hideBuiltinDeepseek` | 关 | 隐藏内置 DeepSeek 供应商，只留「DeepSeek 账号」 |
+| `hideUnroutableModels` | 关 | 把目录里已知不可路由的模型（含 `hy4-preview-x`）从选择器与设置卡列表里剔掉 |
 | `restartButton` | 关 | 菜单里加一个「重启 DeepSeek Harness」入口 |
 
 ### `hideSettingsModels` 的依据
@@ -46,11 +48,32 @@
 **范围说明**：模型清单本身是 dsh-tap 网关返回的上游目录。关掉这一页
 **不影响** `/model` 下拉和模型选择，只少一个只读展示页。
 
+### `hideUnroutableModels` 的依据
+
+这条改的是**数据**，不是 Loader 条目 —— 为了剔几个模型把 `dsh-tap` 整条禁掉是不行的。
+
+- **清单来源**：上游「目录里有 ≠ `/v2` 可路由」是 dsh-tap 的既有事实
+  （`providers/codebuddy/catalog.js` 的 `UNROUTABLE_MODELS`，恒 `11102 service info not found`）。
+  本插件不复制这张表，而是读它的 `POST /dsh-tap/settings {action:'model-list'}` 响应里的
+  `unroutable` + `catalog.models`，只处理**目录里仍在列**的 id（上游删了的历史 id 不再动）。
+- **怎么剔**：对每个「在列且当前在选择器里」的 id 发
+  `POST /dsh-tap/settings {patch:{modelSetEnabled:{id,enabled:false}}}` —— 和设置卡勾选框
+  同一条路径，dsh-tap 自己会把宿主镜像重铺，选择器立刻跟上；宿主发起没有 `Origin` 头，
+  落在它「壳转发/非浏览器放行」的语义里。**不直接写它的文件。**
+- **列表里的行**：浏览器半只加一条 CSS（`.cbc-listrow.cbc-unroutable{display:none}`，
+  以及「某个分组小标题后面只剩死条目时连标题一起隐去」），不动别人的 DOM 节点、
+  不对 `class` 做 MutationObserver。
+- **可逆**：开之前处于启用状态的 id 记在 `~/.dsh/.cache/dsh-tweaks/hide-unroutable.json`
+  （本机 `.cache`，不进同步盘）；关闭开关时按这份清单勾回去。
+- **不做周期对账**：只在启动/开关时执行一次。在 dsh-tap 卡里手动勾回的条目，
+  下次启动会被再剔一次；`GET /dsh-tweaks/status` 的 `note` 会写清这次动了哪几个 id。
+
 ## 路由
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/dsh-tweaks/status` | 每个 tweak 的 `enabled` / `applied` / `error` |
+| `GET` | `/dsh-tweaks/status` | 每个 tweak 的 `enabled` / `applied` / `note` / `error` |
+| `POST` | `/dsh-tweaks/toggle` | 把某个 tweak 的 `enabled` 写回 ③ 的 `dsh-tweaks` 段（界面开关走这条） |
 | `POST` | `/dsh-tweaks/restart` | 真重启宿主。**需显式 `allowRestart: true`**，默认关（会中断会话） |
 | `POST` | `/dsh-tweaks/diag` | 浏览器半诊断，落 `~/.dsh/.cache/dsh-tweaks-client.json` |
 
@@ -66,29 +89,51 @@
         tweaks:
           hideSettingsModels:
             enabled: true
+          hideUnroutableModels:
+            enabled: true
           restartButton:
             enabled: false
 ```
 
+## 两种改动的形态
+
+| 形态 | 效果落在哪 | 声明 |
+| --- | --- | --- |
+| Loader 条目类 | 把目标条目的 `disabled` 置真 | `target: '<entry id>'` |
+| 数据类 | 调目标插件自己的路由（如 dsh-tap 的设置路由）+ 浏览器半 CSS | `menu: true` 加 `apply` / `restore` |
+
+两种都只在 `config.tweaks.<id>.enabled` 上开关；`/dsh-tweaks/status` 对两者一视同仁地
+报 `enabled` / `applied` / `note` / `error`。
+
 ## 加一个开关
 
 ```js
-// index.js
+// index.js —— Loader 条目类
 {
   id: 'myTweak',
   title: '一句话说明它改什么',
   why: '为什么要改、依据是什么、范围边界在哪里 —— 写给半年后的自己看',
-  apply(ctx, tweak, config) { /* 走官方扩展点；失败请抛错，会被记录 */ },
+  target: 'ui-some-entry',   // 把这个条目的 disabled 置真
+}
+
+// index.js —— 数据类（要调目标插件自己的路由 / 需要浏览器半配合）
+{
+  id: 'myDataTweak',
+  title: '…',
+  why: '…',
+  menu: true,                                   // 账号菜单里给一行
+  apply({ origin, stateFile }) { /* 开 */ },
+  restore({ origin, stateFile }) { /* 关：把开之前的状态还回去 */ },
 }
 ```
 
 再在 `cordis.patch.yml` 的 `tweaks` 下加 `myTweak: { enabled: false }`。
+数据类的 `apply` 只在启动/开关时跑一次，失败会按 2 秒间隔重试 8 次再记进状态。
 
 ## Dev
 
 ```bash
-node --check index.js && node --check lib/client.js
-node test/run.mjs      # 26 assertions：注册表 / 开关解析 / 状态汇报 / DOM 纪律
+node test/run.mjs      # 67 assertions：注册表 / 不可路由清单 / 开关解析 / 状态汇报 / DOM 纪律
 ```
 
 ## License

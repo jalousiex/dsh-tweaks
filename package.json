@@ -1,6 +1,6 @@
 {
   "name": "dsh-tweaks",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Switchable small tweaks for DeepSeek Harness (dsh): one YAML block decides which behaviours are on, so the set travels across machines with the profile instead of hiding in scattered files.",
   "type": "module",
   "main": "index.js",
