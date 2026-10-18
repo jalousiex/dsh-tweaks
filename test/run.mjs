@@ -224,10 +224,14 @@ vm.createContext(clientCtx)
 vm.runInContext(clientSource, clientCtx)
 ok('client called ModuleLoader.load', def !== null)
 ok('loader contract uses factory (not exports fn)', typeof def.factory === 'function')
-const client = def.factory(function () {
-  throw new Error('client must not require modules')
+// client 现在用 slots（React）渲染插件页开关列表——测试里给一个最小的 React 桩。
+const fakeReact = { createElement: () => { throw new Error('no render in tests') }, useState: () => [{}, () => {}], useEffect: () => {} }
+const client = def.factory(function (name) {
+  if (name === 'react') return fakeReact
+  throw new Error('client must not require modules besides react')
 })
 const api = client.__internals
+ok('client declares the slots service', Array.isArray(client.inject) && client.inject.includes('slots'))
 
 console.log('client:')
 check('readTweaks with no doc -> no rows', api.readTweaks(null).rows.length, 0)
@@ -262,14 +266,15 @@ ok(
 ok('hide CSS hides unroutable rows', api.HIDE_UNROUTABLE_CSS.includes('.cbc-listrow.cbc-unroutable{display:none!important}'))
 ok('hide CSS collapses an all-dead group title', api.HIDE_UNROUTABLE_CSS.includes('p.cbc-subtitle:not(:has('))
 ok('hide CSS is off while the tweak is off', !api.styleText().includes('cbc-unroutable'))
-ok('base CSS is always present', api.styleText().includes('.dtw-item'))
+ok('base CSS is always present', api.styleText().includes('.dtw-pageitem'))
+ok('page CSS carries the tap quick-filter row', api.styleText().length > 0 && clientSource.includes('dtw-taprow'))
 
 console.log('client static discipline:')
 ok('does not observe class', !/attributeFilter:\s*\[\s*["']class["']/.test(clientSource))
 ok('narrow attributeFilter only', /attributeFilter:\s*\[\s*"aria-expanded",\s*"aria-label"\s*\]/.test(clientSource))
 const onMutationsBody = clientSource.slice(
   clientSource.indexOf('function onMutations'),
-  clientSource.indexOf('fetchStatus().then'),
+  clientSource.indexOf('timer = setInterval'),
 )
 ok('mutation callback inspects no whole document', onMutationsBody.length > 0 && !/document\.querySelectorAll/.test(onMutationsBody))
 ok('mutation callback collects only added subtrees', /collect\(rec\.addedNodes\[j\]\)/.test(onMutationsBody))
