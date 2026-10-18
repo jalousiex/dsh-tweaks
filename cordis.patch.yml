@@ -17,19 +17,29 @@
       config:
         # 只读状态路由，loopback 同源，默认开
         statusRoute: true
-        # 允许 POST /dsh-tweaks/restart 真的重启宿主。默认关：
-        # 重启会中断正在跑的会话，必须由用户显式打开。
-        allowRestart: false
         tweaks:
-          # 设置里隐藏「模型清单」页，只留「账号与余额」。
-          # 模型清单是 dsh-tap 网关的上游目录展示，不影响 /model 下拉。
-          hideSettingsModels:
+          # 隐藏内置 DeepSeek 供应商，只保留「DeepSeek 账号」。
+          hideBuiltinDeepseek:
             enabled: false
           # 把目录里已知不可路由的死模型（glm-4.6v / kimi-k2-thinking /
           # minimax-m2.5 / hy4-preview-x）从选择器与设置卡列表里剔掉。
           # 走 dsh-tap 自己的 /dsh-tap/settings 路由，不写它的文件。
           hideUnroutableModels:
             enabled: false
-          # 一键重启入口（浏览器半渲染按钮）。默认关，因为它会中断会话。
-          restartButton:
+          # 给 node_modules 里的 dsh-tap 打「web 钉选」探测补丁（本机维护脚本，
+          # 改的是他人已安装产物，升级即失效；根治要报上游）。
+          fixTapWebPin:
             enabled: false
+
+        # ── 可调参数（官方约定：凡是可能因部署而异的值都要进 Config）────────
+        # 数据类改动的重试策略（等目标插件的路由注册完）。
+        dataRetry:
+          attempts: 8
+          intervalMs: 2000
+        # 对账型改动被反复弹回时的重试上限。
+        reassertLimit: 10
+        # 兜底对账间隔（毫秒）。0 = 纯事件驱动（默认，不轮询）；
+        # >0 才额外挂一个兜底定时器。
+        fallbackReconcileMs: 0
+        # 浏览器半的状态兜底刷新间隔（毫秒），由 /dsh-tweaks/status 下发。
+        statusRefreshMs: 600000
