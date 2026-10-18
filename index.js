@@ -30,10 +30,8 @@
 
 import z from '@deepseek-ai/schemastery'
 import YAML from 'yaml'
-import { spawn } from 'node:child_process'
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { randomBytes } from 'node:crypto'
-import { arch, homedir } from 'node:os'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 export const name = 'dsh-tweaks'
@@ -283,56 +281,12 @@ function dshHomePath() {
   return process.env.DSH_HOME || join(homedir(), '.dsh')
 }
 
-// ── restartButton：重启宿主进程 ────────────────────────────────────────────
-// 官方没有任何 Host 服务能做这件事（`ctx.hmr` 只重载模块与配置、覆盖不到
-// node_modules；`pluginManager` 只改 profile 文件并在结果里报 restart-required），
-// 所以真重启只能由本插件自己退出当前进程、再拉起同一个可执行文件。
-// 因此它被两道闸门守住：`config.allowRestart` 与 `restartButton` 开关都要开，
-// 而且必须走「先取令牌、再带令牌确认」两段式——重启会硬断所有会话。
-
-/** 本机可执行文件路径（Electron 桌面宿主）。取不到就如实报，不硬编路径。 */
-export function hostExecutable() {
-  const candidates = [
-    process.env.DSH_HOST_EXECUTABLE,
-    process.execPath,
-    process.argv0,
-  ].filter(Boolean)
-  for (const candidate of candidates) {
-    try {
-      if (statSync(candidate).isFile()) return candidate
-    } catch {}
-  }
-  return null
-}
-
-/**
- * 退出并重新拉起宿主。返回 `{ ok, executable, delayMs, error }`。
- * 先把 HTTP 响应冲出去（调用方负责先 response.end），再延迟退出，
- * 否则浏览器会先看到连接被掐断而不是「正在重启」。
- */
-export async function restartHost({ delayMs = 400, spawnHost = spawn } = {}) {
-  const executable = hostExecutable()
-  if (!executable) {
-    return { ok: false, error: '取不到宿主可执行文件路径（process.execPath 不可用）' }
-  }
-  const argv = process.argv.slice(1)
-  const detached = arch() === 'win32' ? { detached: true, stdio: 'ignore' } : { detached: true, stdio: 'ignore' }
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      try {
-        const child = spawnHost(executable, argv, detached)
-        if (child && typeof child.unref === 'function') child.unref()
-      } catch (error) {
-        resolve({ ok: false, executable, delayMs, error: `拉起新进程失败：${String((error && error.message) || error)}` })
-        return
-      }
-      // 已经拉起新的了，现在退掉旧的（退出码 0 = 正常退出，不弹崩溃提示）。
-      process.exit(0)
-      resolve({ ok: true, executable, delayMs })
-    }, delayMs)
-    // process.exit 之后的兜底：万一 spawn 同步抛错，上面已经 resolve 了。
-  })
-}
+// ── 重启宿主：已迁出到独立插件 dsh-restart ─────────────────────────────────
+// 原先这里有一份 spawn + process.exit 的重启实现（restartButton 开关）。它被删掉
+// 是因为：① 官方没有能重启宿主的 Host 服务，自己退进程属于越界；② 它「先拉起新
+// 进程、再退旧进程」会和新进程抢监听端口；③ 入口太深（插件设置页），而 dsh-restart
+// 提供 /restart 命令与 restart_harness 工具，还会记录进行中会话以便重启后续跑。
+// 现在重启一律走 dsh-restart，本插件不再碰进程生命周期。
 
 // ── 数据类改动（hideUnroutableModels）的支撑 ──────────────────────────────
 // 这类开关的效果不在 Loader 条目上（为了剔几个模型把 dsh-tap 整条禁掉是不行的），
@@ -681,11 +635,6 @@ function nonNegativeInt(value, fallback) {
   return Number.isInteger(value) && value >= 0 ? value : fallback
 }
 
-/** 生成一次性确认令牌（重启这种不可逆动作要能被明确确认）。 */
-function randomToken() {
-  return randomBytes(18).toString('base64url')
-}
-
 /**
  * 「对象状态」：这个改动赖以生效的对象此刻是什么状况。
  *
@@ -719,14 +668,9 @@ export function describeSubject(tweak, entry, enabled, state, servicePresent) {
     case 'host':
       // 宿主内置能力（如 deepseekAccount）：由调用方把「服务在不在」传进来
       // （servicePresent 参数），保持本函数纯净可单测。
-      if (tweak.subject?.name === 'deepseekAccount') {
-        return servicePresent === true
-          ? { status: 'ready', label: 'DSH 内置账号服务在位' }
-          : { status: 'missing', label: '取不到 deepseekAccount 服务（dsh-deepseek-account-platform 未组合）' }
-      }
-      return hostExecutable()
-        ? { status: 'ready', label: '宿主进程可执行文件可定位' }
-        : { status: 'missing', label: '定位不到宿主可执行文件' }
+      return servicePresent === true
+        ? { status: 'ready', label: '宿主服务在位' }
+        : { status: 'missing', label: `取不到 ${tweak.subject?.name || '宿主服务'}（未组合或不可用）` }
     default:
       return { status: 'unknown', label: '未声明生效对象' }
   }
@@ -747,8 +691,6 @@ export function apply(ctx, config = {}) {
   const reassertLimit = positiveInt(config?.reassertLimit, 10)
   const fallbackMs = nonNegativeInt(config?.fallbackReconcileMs, 0)
   const statusRefreshMs = positiveInt(config?.statusRefreshMs, 600000)
-  const delayMs = nonNegativeInt(config?.restartDelayMs, 400)
-  const tokenMs = positiveInt(config?.restartTokenMs, 30000)
 
   /**
    * 数据类改动：效果不在 Loader 条目上，而是调目标插件自己的设置路由。
@@ -919,17 +861,11 @@ export function apply(ctx, config = {}) {
           subjectStatusLabel: subject.label,
           effect: tweak.effect || null,
           appliesWhen: tweak.appliesWhen || null,
-          // 有 action 的条目（restartButton）给按钮用：能不能点、为什么不能。
-          actionReady: tweak.action === 'restart'
-            ? config.allowRestart === true && enabled
-            : null,
-          actionBlockedBy: tweak.action === 'restart' && !(config.allowRestart === true && enabled)
-            ? (config.allowRestart !== true ? 'allowRestart=false' : '开关未打开')
-            : null,
         }
       }),
       // 下发给浏览器半的配置（只给客户端真正用得上的值）。
-      config: { statusRefreshMs, restartDelayMs: delayMs },
+      // 注：重启已迁到 dsh-restart，原先下发的 restartDelayMs 随之移除。
+      config: { statusRefreshMs },
     }
   }
 
@@ -1017,80 +953,6 @@ export function apply(ctx, config = {}) {
         },
       }), 'dsh-tweaks:balance-route')
 
-      /**
-       * 重启宿主（restartButton）。两段式：
-       *   ① POST { }                      → 返回一次性 token（不重启）
-       *   ② POST { token }                → 校验通过才真的退进程 + 拉起新进程
-       * 两道闸门：config.allowRestart 与 restartButton 开关都要开。
-       * 令牌一次性、过期作废，且在插件卸载时清空（ctx.effect 管清理）。
-       */
-      const restartTokens = new Map()
-      wsctx.effect(() => {
-        const grant = () => {
-          const token = randomToken()
-          restartTokens.set(token, Date.now() + tokenMs)
-          // 只留最近的几枚，避免无限增长（用户狂点也不会涨）。
-          if (restartTokens.size > 8) {
-            const oldest = [...restartTokens.entries()].sort((a, b) => a[1] - b[1])[0]
-            if (oldest) restartTokens.delete(oldest[0])
-          }
-          return token
-        }
-        return wsctx.webServer.register({
-          kind: 'exact',
-          path: `${ROUTE_PREFIX}/restart`,
-          handler: async (request, response) => {
-            const fail = (code, error) => {
-              response.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-              response.end(JSON.stringify({ ok: false, error }))
-            }
-            // 闸门 1：allowRestart。闸门 2：restartButton 开关。
-            if (config.allowRestart !== true) return fail(403, 'allowRestart=false：重启未开放（见 config.allowRestart）')
-            if (!isEnabled(config, 'restartButton')) return fail(403, 'restartButton 开关未打开')
-
-            let body = {}
-            try {
-              body = JSON.parse((await readRequestBody(request)) || '{}')
-            } catch {
-              return fail(400, '请求体不是 JSON')
-            }
-
-            // 第一步：给令牌。
-            if (!body.token) {
-              response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-              response.end(JSON.stringify({
-                ok: true,
-                stage: 'confirm',
-                token: grant(),
-                expiresInMs: tokenMs,
-                message: '重启会硬断当前所有会话。再点一次确认，或带上这个 token 调用本路由。',
-              }))
-              return undefined
-            }
-
-            // 第二步：校验令牌（一次性 + 过期）。
-            const expiry = restartTokens.get(body.token)
-            restartTokens.delete(body.token)
-            if (expiry === undefined) return fail(400, '令牌无效或已被用过，请重新确认')
-            if (Date.now() > expiry) return fail(400, '令牌已过期，请重新确认')
-
-            const executable = hostExecutable()
-            if (!executable) return fail(500, '取不到宿主可执行文件路径，无法重启')
-
-            // 先把响应冲出去，再延迟重启——否则浏览器看到的是连接被掐断。
-            response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-            response.end(JSON.stringify({
-              ok: true,
-              stage: 'restarting',
-              executable,
-              delayMs,
-              message: '正在重启 DeepSeek Harness……',
-            }))
-            void restartHost({ delayMs })
-            return undefined
-          },
-        })
-      }, 'dsh-tweaks:restart-route')
     })
   }
 }

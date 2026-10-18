@@ -36,7 +36,7 @@
 | --- | --- | --- | --- |
 | `hideBuiltinDeepseek` | 关 | 隐藏内置供应商（模型列表只留「DeepSeek 账号」） | Loader 条目 `llm-deepseek` |
 | `hideUnroutableModels` | 关 | 剔掉用不了的模型（一选就报错的那些） | 插件 `dsh-tap` 的设置路由 |
-| `restartButton` | 关 | 插件页的「重启」按钮（两段式确认） | 宿主进程本身 |
+> 重启入口**不在本插件**：已迁到独立插件 `dsh-restart`（`/restart` 命令 + `restart_harness` 工具 + 同源端点）。原先的 `restartButton` / `POST /dsh-tweaks/restart` 与 `allowRestart` 配置已移除。
 | `fixTapWebPin` | 关 | 修掉 dsh-tap 常驻的「宿主漂移」假告警（本机维护脚本，不是插件该做的事） | 磁盘文件 `node_modules/dsh-tap/index.js` |
 | `sidebarBalance` | 关 | 侧边栏底部显示 DSH 内置账号余额（充值 / 赠金分开，右侧带刷新） | 宿主服务 `deepseekAccount` |
 
@@ -137,45 +137,11 @@ dsh-tap 0.20.0 的「web 钉选对账」探测 `webService?.()?.searchProviderId
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/dsh-tweaks/status` | 每个 tweak 的 `enabled` / `applied` / `present` / `effective` / `subject*` / `note` / `error`，外加一段 `config`（下发给浏览器半的 `statusRefreshMs`、`restartDelayMs`） |
+| `GET` | `/dsh-tweaks/status` | 每个 tweak 的 `enabled` / `applied` / `present` / `effective` / `subject*` / `note` / `error`，外加一段 `config`（下发给浏览器半的 `statusRefreshMs`） |
 | `GET` | `/dsh-tweaks/balance` | `sidebarBalance` 的数据：`{ ok, at, signedIn, balance:{ok,wallets,bonusWallets,error?}, reason? }`。10s 缓存，`?refresh=1` 绕过 |
 | `POST` | `/dsh-tweaks/toggle` | 把某个 tweak 的 `enabled` 写回 **③** 的 `dsh-tweaks` 段（界面开关走这条）。**落盘前先做 YAML 解析校验**，不过就拒绝写入 |
-| `POST` | `/dsh-tweaks/restart` | 重启宿主。**两段式**：不带 token 调用只换一枚一次性确认令牌；带 token 再调才真的重启 |
 
 前两条由 `config.statusRoute` 把关（默认开，只读且在 loopback 上）。
-
-### `restartButton` 怎么实现的（以及为什么这么做）
-
-官方**没有**能重启宿主的服务——`ctx.hmr` 只重载模块与配置（覆盖不到 `node_modules`），
-`ctx.pluginManager` 只改 profile 文件、最多在结果里报一个 `restart-required`。
-所以真重启只能由本插件自己来：先 `spawn` 同一个可执行文件（detached），
-再 `process.exit(0)` 退掉旧进程。
-
-#### 入口放在哪
-
-重启入口在**插件页**（设置 › 插件 › dsh-tweaks，`restartButton` 卡片里的按钮）。
-
-侧边栏底部（`sidebar.footer.action`）试过又撤掉了，两个原因：
-
-1. 那一行是与 `dsh-tap-quota` 的余额卡片共用的 flex 行，按钮挤在「设置」旁边，位置不对；
-2. **头像菜单无法由插件扩展**——`settings.launcher` 是 `single` 型且已被官方 `AccountMenu`
-   独占（注册它会把整个账号菜单换掉）。全部 88 个 slot 过了一遍，没有任何
-   「头像菜单项」这种槽。
-
-窗口菜单栏（应用/编辑）同理：由 desktop-host 独占，slot 目录里没有 native menu 扩展点。
-
-#### 三道闸门
-
-因为重启会**硬断当前所有会话**，它被三道闸门守住，任一不过就 403 且不做事：
-
-1. `config.allowRestart === true`（默认关）；
-2. `restartButton` 开关为开；
-3. 两段式确认：先 `POST {}` 换一枚一次性令牌（30s 过期、单次有效、只在内存里），
-   带令牌再 `POST { token }` 才执行。按钮的交互是——第一次点变成
-   「确认重启（会话会被中断）」+「取消」，两步都在原地完成。
-
-另外两个细节：响应会**先 `end()` 再延迟退出**（否则浏览器看到的是连接被掐断而不是
-「正在重启」）；客户端把「连接断开」当成重启已生效，而不是报错。
 
 ## 配置写在哪一层
 
@@ -197,9 +163,6 @@ dsh-tap 0.20.0 的「web 钉选对账」探测 `webService?.()?.searchProviderId
       name: 'dsh-tweaks'
       config:
         statusRoute: true      # 只读状态路由
-        allowRestart: false    # 允许真重启（还要 restartButton 也开，且走两段式确认）
-        restartDelayMs: 400    # 先冲响应、再退进程的延迟
-        restartTokenMs: 30000  # 确认令牌有效期
         # 可调参数（官方约定：可能因部署而异的值都要进 Config）
         dataRetry:             # 数据类改动等上游路由就绪的重试
           attempts: 8
@@ -212,8 +175,6 @@ dsh-tap 0.20.0 的「web 钉选对账」探测 `webService?.()?.searchProviderId
             enabled: true
           hideUnroutableModels:
             enabled: true
-          restartButton:
-            enabled: false
           fixTapWebPin:
             enabled: true
           sidebarBalance:
@@ -332,7 +293,6 @@ node test/run.mjs      # 165 assertions：注册表与生效对象元数据 / �
 | 1 | **就地行（`decorateTapSection` + `.cbc-*` CSS）直读 dsh-tap 的 DOM/样式** | 官方要求只用 slot 贡献 UI。这里保留是因为产品要求"在 dsh-tap 卡里就地开关"；代价是 dsh-tap 改结构就失效（对不上锚点就静默不做，不崩） |
 | 2 | **`fixTapWebPin` 改他人已安装产物** | 属本机维护脚本，技术债；根治要报上游 |
 | 3 | **配置写 ③ 而非官方 `config-editor`（落 ②）** | 跨机约定要求权威配置在 ③；官方 `config-editor` 只写 ②，会被 ③ 覆盖。官方另一条路是声明 `Config` 后由 `ctx.settings` 自动投影成表单，但它的写入同样落 ② |
-| 4 | **`restartButton` 自己退进程再拉起（`spawn` + `process.exit`）** | 官方没有能重启宿主的服务（窗口菜单栏也不可扩展），只能这么做；因此加了三道闸门（`allowRestart` + 开关 + 一次性令牌两段式确认） |
 | 5 | **未给 agent 暴露 Tool** | 官方要求"一个操作两个入口"（UI + Tool）共用同一实现；目前只有 UI + loopback 路由 |
 | 6 | **缺 locale/icon** | 官方建议 bundle 导出 `locale/*.json` 的 `meta.title/description` 与图标；当前落回 `package.json` 的英文描述 |
 

@@ -107,14 +107,11 @@ ok(
   new Set(TWEAKS.map((t) => t.id)).size === TWEAKS.length,
 )
 ok('hideSettingsModels is gone (it disabled the whole 模型 settings section)', !TWEAKS.some((t) => t.id === 'hideSettingsModels'))
-ok('restartButton is registered', TWEAKS.some((t) => t.id === 'restartButton'))
-ok('hideBuiltinDeepseek is registered', TWEAKS.some((t) => t.id === 'hideBuiltinDeepseek'))
 ok('hideUnroutableModels is registered', TWEAKS.some((t) => t.id === 'hideUnroutableModels'))
 ok('fixTapWebPin is registered', TWEAKS.some((t) => t.id === 'fixTapWebPin'))
 
 console.log('tweaks targets:')
 check('hideBuiltinDeepseek targets the built-in provider', TWEAKS.find((t) => t.id === 'hideBuiltinDeepseek').target, 'llm-deepseek')
-check('restartButton declares no target', TWEAKS.find((t) => t.id === 'restartButton').target, undefined)
 check('no tweak targets the settings models entry', TWEAKS.some((t) => t.target === 'ui-settings-models'), false)
 const hideUnroutable = TWEAKS.find((t) => t.id === 'hideUnroutableModels')
 check('hideUnroutableModels declares no loader target', hideUnroutable.target, undefined)
@@ -207,7 +204,6 @@ ok('reassertLimit declared with default 10', /reassertLimit:\s*z\.number\(\)\.de
 ok('fallbackReconcileMs defaults to 0 (event-driven, no polling)', /fallbackReconcileMs:\s*z\.number\(\)\.default\(0\)/.test(hostSource))
 ok('statusRefreshMs declared with default', /statusRefreshMs:\s*z\.number\(\)\.default\(600000\)/.test(hostSource))
 ok('statusRoute still defaults on', /statusRoute:\s*z\.boolean\(\)\.default\(true\)/.test(hostSource))
-ok('allowRestart still defaults off', /allowRestart:\s*z\.boolean\(\)\.default\(false\)/.test(hostSource))
 ok('apply() re-arms the retry/interval from config, not literals', /positiveInt\(config\?\.dataRetry\?\.attempts, 8\)/.test(hostSource) && /nonNegativeInt\(config\?\.dataRetry\?\.intervalMs, 2000\)/.test(hostSource))
 // 这一 schemastery 版本的嵌套容器默认值必须是「值」；写成函数会让
 // 「配置里没写 tweaks / dataRetry」直接校验失败、插件起不来。
@@ -297,8 +293,6 @@ ok(
   'subject kinds are from the known set',
   TWEAKS.every((t) => ['entry', 'plugin', 'file', 'host'].includes(t.subject.kind)),
 )
-check('restartButton acts on the host process', TWEAKS.find((t) => t.id === 'restartButton').subject.kind, 'host')
-check('restartButton declares the restart action', TWEAKS.find((t) => t.id === 'restartButton').action, 'restart')
 check('hideBuiltinDeepseek acts on a loader entry', TWEAKS.find((t) => t.id === 'hideBuiltinDeepseek').subject.kind, 'entry')
 check('hideUnroutableModels acts on a plugin', TWEAKS.find((t) => t.id === 'hideUnroutableModels').subject.kind, 'plugin')
 check('fixTapWebPin acts on a file', TWEAKS.find((t) => t.id === 'fixTapWebPin').subject.kind, 'file')
@@ -367,16 +361,6 @@ ok('missing carries a human reason', describeSubject(entryTweak, undefined, true
 const fileTweak = TWEAKS.find((t) => t.id === 'fixTapWebPin')
 check('file kind resolves against this machine', ['ready', 'missing'].includes(describeSubject(fileTweak, undefined, true, { ok: true }).status), true)
 
-console.log('restart 宿主安全闸门:')
-check('restart route exists in source', hostSource.includes('${ROUTE_PREFIX}/restart'), true)
-ok('gate 1: allowRestart required', hostSource.includes("if (config.allowRestart !== true) return fail(403"))
-ok('gate 2: restartButton switch required', hostSource.includes("if (!isEnabled(config, 'restartButton')) return fail(403"))
-ok('token is single-use (deleted on check)', hostSource.includes('restartTokens.delete(body.token)'))
-ok('token expires', hostSource.includes('Date.now() > expiry'))
-ok('bad token is refused', hostSource.includes('令牌无效或已被用过'))
-ok('responds before restarting', hostSource.indexOf('stage: "restarting"') < hostSource.indexOf('void restartHost'))
-ok('restartHost spawns detached then exits', hostSource.includes('spawn(executable, argv') === false && hostSource.includes('spawnHost(executable, argv, detached)') && hostSource.includes('process.exit(0)'))
-
 console.log('isEnabled:')
 check('unknown config -> false', isEnabled({}, 'hideBuiltinDeepseek'), false)
 check('missing tweaks -> false', isEnabled({ tweaks: undefined }, 'x'), false)
@@ -390,8 +374,8 @@ check('one row per tweak', described.length, TWEAKS.length)
 const row = described.find((r) => r.id === 'hideBuiltinDeepseek')
 ok('reflects enabled flag', row.enabled === true)
 ok('reports applied=false when not applied', row.applied === false)
-const withError = describeTweaks({}, new Map([['restartButton', { ok: false, error: 'boom' }]]))
-ok('surfaces apply error', withError.find((r) => r.id === 'restartButton').error === 'boom')
+const withError = describeTweaks({}, new Map([['hideBuiltinDeepseek', { ok: false, error: 'boom' }]]))
+ok('surfaces apply error', withError.find((r) => r.id === 'hideBuiltinDeepseek').error === 'boom')
 
 console.log('checkTarget:')
 check('no target -> ok', checkTarget(null, []).ok, true)
@@ -439,7 +423,7 @@ check(
 )
 check(
   'readTweaks includes a tweak that only has an action',
-  api.readTweaks({ tweaks: [{ id: 'restartButton', action: 'restart', enabled: true }] }).rows.length,
+  api.readTweaks({ tweaks: [{ id: 'sidebarBalance', menu: true, enabled: true }] }).rows.length,
   1,
 )
 check(
@@ -496,21 +480,12 @@ const bareRow = api.readTweaks({ tweaks: [{ id: 'x', menu: true, enabled: false 
 check('missing fields degrade safely', [bareRow.what, bareRow.subjectKind, bareRow.subjectLabel], ['', '', ''])
 check('unknown subject status degrades safely', bareRow.subjectStatus, 'unknown')
 
-console.log('restart 两段式确认:')
-ok('client calls the restart route', clientSource.includes('var RESTART = "/dsh-tweaks/restart"'))
-ok('client exposes a restart helper', clientSource.includes('function restart(token)'))
-ok('first call sends no token (ask only)', /body: JSON\.stringify\(token \? \{ token: token \} : \{\}\)/.test(clientSource))
-ok('confirmation is required before restart', clientSource.includes('确认重启（会话会被中断）') && clientSource.includes('取消'))
-ok('restart treats a dropped connection as success', clientSource.includes('连接已断开，宿主正在重启'))
-ok('both entries share one restart state machine', clientSource.includes('function useRestart(row)') && clientSource.includes('useRestart(props.row)'))
-
 console.log('侧边栏入口（已撤销，记录原因）:')
 ok('no longer registers sidebar.footer.action', !clientSource.includes('ctx.slots.inject("sidebar.footer.action"'))
 ok('no dead sidebar component or slot id', !clientSource.includes('SidebarRestart') && !clientSource.includes('RESTART_SLOT_ID'))
 ok('header records why the sidebar entry was dropped', clientSource.includes('那一行与 dsh-tap-quota 的余额卡片共用'))
 ok('header records that the avatar menu has no item slot', clientSource.includes('没有任何菜单项 slot'))
 ok('sidebar CSS removed', !clientSource.includes('.dtw-footbtn') && !clientSource.includes('dtw-sr'))
-ok('restart stays only on the plugin page', clientSource.includes('`restartButton` 的重启按钮也在这里'))
 
 console.log('卡片精简（详情进悬浮，不平铺）:')
 ok('tooltip carries the full rationale', clientSource.includes('"依据：" + row.why') && clientSource.includes('"生效条件：" + row.appliesWhen') && clientSource.includes('"生效方式：" + row.effect'))
