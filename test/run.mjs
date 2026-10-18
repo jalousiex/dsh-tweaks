@@ -96,8 +96,8 @@ const hostCtx = {
   Intl,
 }
 vm.createContext(hostCtx)
-vm.runInContext(hostSource + '\n;globalThis.__host = { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, unroutableIds, TAP_SETTINGS_ROUTE, setTweakEnabledInText, validatePatchText, describeSubject, patchTapWebPinText, tapIndexPath, TAP_WEBPIN_OLD, TAP_WEBPIN_NEW, Config, normalizeBalance, readBalance, accountClientMetadata };', hostCtx)
-const { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, unroutableIds, TAP_SETTINGS_ROUTE, setTweakEnabledInText, validatePatchText, describeSubject, patchTapWebPinText, tapIndexPath, TAP_WEBPIN_OLD, TAP_WEBPIN_NEW, Config, normalizeBalance, readBalance, accountClientMetadata } = hostCtx.__host
+vm.runInContext(hostSource + '\n;globalThis.__host = { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, unroutableIds, TAP_SETTINGS_ROUTE, setTweakEnabledInText, tweakIsPresentInPatch, validatePatchText, describeSubject, patchTapWebPinText, tapIndexPath, TAP_WEBPIN_OLD, TAP_WEBPIN_NEW, Config, normalizeBalance, readBalance, accountClientMetadata };', hostCtx)
+const { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, unroutableIds, TAP_SETTINGS_ROUTE, setTweakEnabledInText, tweakIsPresentInPatch, validatePatchText, describeSubject, patchTapWebPinText, tapIndexPath, TAP_WEBPIN_OLD, TAP_WEBPIN_NEW, Config, normalizeBalance, readBalance, accountClientMetadata } = hostCtx.__host
 
 console.log('TWEAKS registry:')
 ok('is a non-empty frozen list', Array.isArray(TWEAKS) && TWEAKS.length > 0 && Object.isFrozen(TWEAKS))
@@ -530,6 +530,74 @@ ok('does not ship diag counters', !/diag\.(sweeps|inserts|toggles)/.test(clientS
 ok('refresh interval comes from the host status route', /state\.refreshMs/.test(clientSource) && /config\.statusRefreshMs/.test(clientSource))
 ok('no hardcoded 600000 timer', !/setInterval\([^)]*,\s*REFRESH_MS\)/.test(clientSource))
 ok('client still declares the slots service', clientSource.includes('inject = ["slots"]'))
+
+console.log('回归：点开关后列表不能消失（transient /status 失败必须保留旧数据）:')
+// 根因：宿主写 ③ 会重载插件，/status 短暂失败；如果把 rows 置空，整张列表会瞬间消失。
+ok('transient failure keeps rows (no rows: [])', !/\.catch\(function \(\) \{\s*\n\s*state = \{ rows: \[\]/.test(clientSource))
+ok('transient failure marks stale instead', /stale: true/.test(clientSource) && /rows: state\.rows \|\| \[\]/.test(clientSource))
+ok('toggle failure keeps the list', /lastError: String/.test(clientSource) && /rows: state\.rows \|\| \[\]/.test(clientSource))
+ok('page shows a stale banner', clientSource.includes('宿主正在重载'))
+ok('page shows the last operation error', clientSource.includes('上一次操作失败'))
+ok('stale/lastError cleared by a good fetch', !/return \{ rows: rows, loaded: true, hideUnroutable: hideUnroutable, refreshMs: refreshMs, stale/.test(clientSource))
+// hmr 实际要约 2s 才落地；固定 600ms 会读到半应用状态。
+ok('toggle waits for the value to actually apply', clientSource.includes('function waitForApplied'))
+ok('does not sleep a fixed 600ms before refresh', !/setTimeout\(resolve, 600\)/.test(clientSource))
+ok('waitForApplied tolerates a reloading host', /宿主正在重载：稍等再试/.test(clientSource))
+
+console.log('回归：宿主服务状态必须现查，不能被启动时的 error 钉死:')
+// 事故：sidebarBalance 在 apply 时 deepseekAccount 还没组合，记下 error；
+// 之后服务起来了，但 describeSubject 先判 state.error，导致永久 mismatch。
+const hostTweak = TWEAKS.find((t) => t.subject && t.subject.kind === 'host')
+check('host kind exists in the registry', Boolean(hostTweak), true)
+check(
+  'live service presence wins over a stale error',
+  describeSubject(hostTweak, undefined, true, { ok: false, error: 'stale' }, true).status,
+  'ready',
+)
+check(
+  'missing service still reports missing',
+  describeSubject(hostTweak, undefined, true, { ok: false, error: 'stale' }, false).status,
+  'missing',
+)
+ok(
+  'host kind ignores the stale error text',
+  !String(describeSubject(hostTweak, undefined, true, { ok: false, error: 'stale' }, true).label).includes('stale'),
+)
+ok('apply no longer records a startup verdict for no-target tweaks', !hostSource.includes("'deepseekAccount 服务不在（dsh-deepseek-account-platform 未组合）'"))
+
+console.log('回归：toggle 的返回语义（值已相同 ≠ 失败）:')
+ok('helper separates "already set" from "key missing"', hostSource.includes('function tweakIsPresentInPatch'))
+check('tweak 存在 -> present', tweakIsPresentInPatch(patchText, 'restartButton'), true)
+check('tweak 不存在 -> absent', tweakIsPresentInPatch(patchText, 'noSuchTweak'), false)
+check('id 只匹配整键，不做子串', tweakIsPresentInPatch(patchText, 'restart'), false)
+ok('route reports unchanged instead of an error', hostSource.includes('unchanged: true'))
+ok('route still errors for a genuinely missing key', hostSource.includes('③ 里没有这个键，切不了'))
+
+console.log('回归：按归属对象分组（owner，含二级组）:')
+ok('groups by owner, not by subject kind', clientSource.includes('function groupRows(rows)') && /r\.ownerName \|\| "other"/.test(clientSource))
+ok('owner order puts DSH first', /OWNER_ORDER = \["dsh"\]/.test(clientSource))
+ok('renders a group header', clientSource.includes('function GroupHeader'))
+ok('group header summarises enabled count', clientSource.includes('已启用'))
+ok('group header flags abnormal objects', clientSource.includes('项异常'))
+ok('has secondary grouping inside an owner', clientSource.includes('function groupByField') && /groupByField\(g\.rows, "group"\)/.test(clientSource))
+ok('secondary header only when labelled', clientSource.includes('function SubGroupHeader') && /SUBGROUP_LABEL\[sub\.key\]/.test(clientSource))
+ok('groups wrap the cards', /React\.createElement\(GroupHeader/.test(clientSource))
+
+console.log('回归：dsh-tap 的两个开关同组:')
+// 关键：过滤模型是 kind=plugin，修假告警是 kind=file，但 owner 都是 dsh-tap。
+const tapOwner = TWEAKS.filter((t) => t.owner && t.owner.name === 'dsh-tap')
+check('two tweaks belong to dsh-tap', tapOwner.length, 2)
+check('their subject kinds differ', [...new Set(tapOwner.map((t) => t.subject.kind))].sort(), ['file', 'plugin'])
+check('but their owner is the same', [...new Set(tapOwner.map((t) => t.owner.name))], ['dsh-tap'])
+check('the file patch is in the patch subgroup', TWEAKS.find((t) => t.id === 'fixTapWebPin').group, 'patch')
+check('the model filter is not in a subgroup', TWEAKS.find((t) => t.id === 'hideUnroutableModels').group, undefined)
+check('DSH-owned tweaks exist', TWEAKS.filter((t) => t.owner && t.owner.name === 'dsh').length, 2)
+ok('every tweak declares an owner', TWEAKS.every((t) => t.owner && t.owner.name && t.owner.label))
+
+console.log('回归：标题文案:')
+check('model filter renamed', TWEAKS.find((t) => t.id === 'hideUnroutableModels').title, '过滤不可路由模型')
+ok('title says it is a filter/option', /过滤/.test(TWEAKS.find((t) => t.id === 'hideUnroutableModels').title))
+ok('in-page row uses the same wording', clientSource.includes('过滤不可路由模型'))
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exitCode = fail === 0 ? 0 : 1

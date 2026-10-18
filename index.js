@@ -45,10 +45,17 @@ export const ROUTE_PREFIX = '/dsh-tweaks'
  * `id`     — stable key used in `config.<id>.enabled`. Never rename casually:
  *            it is what a user's saved config refers to.
  * `title`  — human label (Chinese first, since the user-facing docs are Chinese).
- * `why`    — one-line rationale, shown by `/dsh-tweaks/status` so a future
- *            reader understands *why* this tweak exists before deleting it.
+ * `what`   — one short sentence: what it changes (the card body).
+ * `why`    — long rationale, shown by the status route / hover.
  * `target` — the Loader entry id this tweak disables. Omitted = nothing to
  *            disable (the client half renders something instead).
+ * `subject`— WHAT the tweak acts on. `kind` picks the status check
+ *            (entry / plugin / file / host); `name`/`label` are for display.
+ * `owner`  — WHICH thing the switch belongs to, for grouping in the UI.
+ *            Deliberately separate from `subject.kind`: patching dsh-tap's
+ *            index.js has `kind: 'file'` (it is a file check) but still
+ *            belongs to dsh-tap (`owner.name: 'dsh-tap'`). Grouping by
+ *            `kind` would scatter one plugin's tweaks across sections.
  */
 export const TWEAKS = Object.freeze([
   {
@@ -61,14 +68,16 @@ export const TWEAKS = Object.freeze([
       '列表里就只剩「DeepSeek 账号」。',
     // 生效对象：Loader 条目（宿主侧的插件行）。
     subject: { kind: 'entry', name: 'llm-deepseek', label: '内置 DeepSeek 供应商' },
+    // 归属：DSH 自身的内置供应商条目。
+    owner: { name: 'dsh', label: 'DeepSeek Harness', kind: 'host' },
     effect: '禁用该条目（disabled），不改任何文件。',
     appliesWhen: '该条目在当前 profile 里存在。',
     target: 'llm-deepseek',
   },
   {
     id: 'hideUnroutableModels',
-    title: '剔掉用不了的模型',
-    what: '把目录里在列、但一选就报错的模型从模型列表里摘掉。',
+    title: '过滤不可路由模型',
+    what: '在模型列表里加一层过滤：把路由不通的模型藏起来，不再出现在选择器里。',
     why:
       '网关目录（/v3/config）里在列、但 /v2/chat/completions 恒 11102 service info not found 的条目' +
       '（glm-4.6v / kimi-k2-thinking / minimax-m2.5 / hy4-preview-x）在 dsh-tap 里只是置灰，' +
@@ -80,6 +89,8 @@ export const TWEAKS = Object.freeze([
       '在 dsh-tap 卡里手动勾回的条目，下次启动会被再剔一次。',
     // 生效对象：另一个插件（dsh-tap）自己的数据。
     subject: { kind: 'plugin', name: 'dsh-tap', label: 'dsh-tap（CodeBuddy 网关）' },
+    // 归属：dsh-tap。
+    owner: { name: 'dsh-tap', label: 'dsh-tap（CodeBuddy 网关）', kind: 'plugin' },
     effect: '调它自己的设置路由停用死模型；设置卡里的行靠 CSS 隐去。',
     appliesWhen: 'dsh-tap 已装且设置路由已就绪。',
     menu: true,
@@ -101,6 +112,8 @@ export const TWEAKS = Object.freeze([
       'cookie 体系里，OAuth 不可达（见 dsh-tap docs/rules/quota-signals.md R-Q10，标未解）。',
     // 生效对象：宿主内置账号服务（不是插件、不是文件）。
     subject: { kind: 'host', name: 'deepseekAccount', label: 'DSH 内置账号服务' },
+    // 归属：DSH 自身的账号服务。
+    owner: { name: 'dsh', label: 'DeepSeek Harness', kind: 'host' },
     effect: '读 getBalance / getState，经 /dsh-tweaks/balance 下发给浏览器半渲染。',
     appliesWhen: 'deepseekAccount 服务已组合（dsh-deepseek-account-platform 在位）。',
     menu: true,
@@ -120,6 +133,10 @@ export const TWEAKS = Object.freeze([
       '若上游代码形态变了（对不上 OLD 片段），不动文件并在状态里如实报「形态不匹配」。' +
       '根治办法是把修复报给 dsh-tap 上游，而不是长期打补丁。',
     subject: { kind: 'file', name: 'dsh-tap/index.js', label: 'dsh-tap 的 index.js' },
+    // 归属仍是 dsh-tap：改的是它的产物，所以和「过滤不可路由模型」同组。
+    // （subject.kind 是 'file'，只影响状态检查；分组看 owner。）
+    owner: { name: 'dsh-tap', label: 'dsh-tap（CodeBuddy 网关）', kind: 'plugin' },
+    group: 'patch',
     effect: '对该文件做幂等字符串替换。',
     appliesWhen: '本机能找到 dsh-tap；改了需重启 DSH。',
     menu: true,
@@ -184,6 +201,11 @@ export function describeTweaks(config, applied, servicePresent) {
       applied: applied.has(t.id),
       error: state?.error ?? null,
       subject: t.subject || null,
+      owner: t.owner || null,
+      ownerName: t.owner?.name ?? null,
+      ownerLabel: t.owner?.label ?? null,
+      ownerKind: t.owner?.kind ?? null,
+      group: t.group ?? null,
       subjectKind: t.subject?.kind ?? null,
       subjectLabel: t.subject?.label ?? null,
       subjectStatus: subject.status,
@@ -210,6 +232,27 @@ export function checkTarget(target, tree) {
   return hit
     ? { ok: true, present: true, reason: `found ${target}` }
     : { ok: false, present: false, reason: `target ${target} is not in the config tree` }
+}
+
+/**
+ * 判断某个 tweak 键是否真的出现在 ③ 的 dsh-tweaks 段里。
+ * 用来把「值已相同（改不动很正常）」和「根本没有这个键（真错）」分开——
+ * `setTweakEnabledInText` 对两者的返回值都是「文本没变」。
+ */
+export function tweakIsPresentInPatch(text, id) {
+  const lines = String(text).split(/\r?\n/)
+  const start = lines.findIndex((l) => /^\s*-\s*id:\s*['"]?dsh-tweaks['"]?\s*$/.test(l))
+  if (start < 0) return false
+  let end = lines.length
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^\s*-\s*id:\s*/.test(lines[i])) { end = i; break }
+  }
+  const escaped = String(id).replace(/[.*+?^${}()|[\]\\]/g, (c) => '\\' + c)
+  const keyRe = new RegExp('^\\s+' + escaped + ':\\s*(?:#.*)?$')
+  for (let i = start + 1; i < end; i++) {
+    if (keyRe.test(lines[i])) return true
+  }
+  return false
 }
 
 /**
@@ -650,9 +693,21 @@ function nonNegativeInt(value, fallback) {
  */
 export function describeSubject(tweak, entry, enabled, state, servicePresent) {
   if (!enabled) return { status: 'idle', label: '未启用' }
+
+  const kind = tweak.subject && tweak.subject.kind
+
+  // `host` 类对象可以用「此刻服务在不在」直接判定，这个结论比任何
+  // 启动时记下的 error 都新——所以先判它，避免一条过期的 error
+  // 把「其实好好的」永久盖成 mismatch（sidebarBalance 就这么错过）。
+  if (kind === 'host') {
+    return servicePresent === true
+      ? { status: 'ready', label: '宿主服务在位' }
+      : { status: 'missing', label: `取不到 ${tweak.subject?.name || '宿主服务'}（未组合或不可用）` }
+  }
+
   if (state && state.error) return { status: 'mismatch', label: `对象在，但状态异常：${state.error}` }
 
-  switch (tweak.subject && tweak.subject.kind) {
+  switch (kind) {
     case 'entry':
       if (!entry) return { status: 'missing', label: '条目不在当前 Loader 树里（插件可能被移除或改名）' }
       return entry.disabled === true
@@ -665,12 +720,6 @@ export function describeSubject(tweak, entry, enabled, state, servicePresent) {
     case 'file':
       if (!tapIndexPath()) return { status: 'missing', label: '找不到 dsh-tap 的 node_modules 部署' }
       return { status: 'ready', label: '文件在位（改完需重启 DSH 生效）' }
-    case 'host':
-      // 宿主内置能力（如 deepseekAccount）：由调用方把「服务在不在」传进来
-      // （servicePresent 参数），保持本函数纯净可单测。
-      return servicePresent === true
-        ? { status: 'ready', label: '宿主服务在位' }
-        : { status: 'missing', label: `取不到 ${tweak.subject?.name || '宿主服务'}（未组合或不可用）` }
     default:
       return { status: 'unknown', label: '未声明生效对象' }
   }
@@ -756,11 +805,9 @@ export function apply(ctx, config = {}) {
     }
     if (!tweak.target) {
       // 无 target 的改动（如 sidebarBalance）没有条目可收敛，效果由它自己的
-      // 路由兑现。这里只判「生效对象在不在」，把结论如实写进状态。
-      if (tweak.subject?.name === 'deepseekAccount' && !accountServicePresent()) {
-        applied.set(tweak.id, { ok: false, error: 'deepseekAccount 服务不在（dsh-deepseek-account-platform 未组合）' })
-        return
-      }
+      // 路由兑现。这里**不**判「生效对象在不在」——服务可能在 apply 之后才组合
+      // （插件加载顺序不定），那会让一条过期的结论永久钉在状态里。
+      // 「对象在不在」交给 /status 的 describeSubject() 现查现报。
       applied.set(tweak.id, { ok: true, error: null })
       return
     }
@@ -857,6 +904,12 @@ export function apply(ctx, config = {}) {
           subject: tweak.subject || null,
           subjectKind: (tweak.subject && tweak.subject.kind) || null,
           subjectLabel: (tweak.subject && tweak.subject.label) || null,
+          // 归属（分组用）：与 subject.kind 分开——改 dsh-tap 的文件仍归 dsh-tap。
+          owner: tweak.owner || null,
+          ownerName: (tweak.owner && tweak.owner.name) || null,
+          ownerLabel: (tweak.owner && tweak.owner.label) || null,
+          ownerKind: (tweak.owner && tweak.owner.kind) || null,
+          group: tweak.group ?? null,
           subjectStatus: subject.status,
           subjectStatusLabel: subject.label,
           effect: tweak.effect || null,
@@ -893,8 +946,20 @@ export function apply(ctx, config = {}) {
             if (!TWEAKS.some((t) => t.id === body.id)) throw new Error('unknown tweak: ' + body.id)
             const file = join(dshHomePath(), 'cordis.patch.yml')
             const before = readFileSync(file, 'utf8')
-            const after = setTweakEnabledInText(before, body.id, body.enabled === true)
-            if (after === before) throw new Error('tweak ' + body.id + ' 不在 ' + file + ' 的 dsh-tweaks 段里')
+            const want = body.enabled === true
+            const after = setTweakEnabledInText(before, body.id, want)
+            if (after === before) {
+              // 文本没变有两种原因，必须分开报——原来一律报「不在段里」，
+              // 于是「值已经就是这个」也被当成失败，用户以为开关坏了。
+              const present = tweakIsPresentInPatch(before, body.id)
+              if (!present) {
+                throw new Error(`tweak ${body.id} 不在 ${file} 的 dsh-tweaks 段里（③ 里没有这个键，切不了）`)
+              }
+              // 已经是目标值：幂等成功，不写盘。
+              response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+              response.end(JSON.stringify({ ok: true, id: body.id, enabled: want, file, unchanged: true }))
+              return undefined
+            }
             // 落盘前必须过 YAML 这一关：③ 一旦写成不可解析的文档，宿主下次
             // 启动会在 parsePatchList 直接抛错、整层丢失（= 所有开关失效）。
             // 宁可不写，也绝不把坏配置写进权威层。
