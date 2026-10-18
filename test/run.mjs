@@ -9,9 +9,10 @@
  *   - browser half: lib/client.js evaluated against a fake __ModuleLoader__.
  */
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { homedir } from 'node:os'
 import vm from 'node:vm'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -43,10 +44,10 @@ const hostSource = readFileSync(join(root, 'index.js'), 'utf8')
   .replace(/^import .*$/gm, '')
   .replace(/^export /gm, '')
 
-const hostCtx = { console, process, Buffer, setTimeout, clearTimeout }
+const hostCtx = { console, process, Buffer, setTimeout, clearTimeout, join, dirname, homedir, readdirSync, statSync }
 vm.createContext(hostCtx)
-vm.runInContext(hostSource + '\n;globalThis.__host = { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, unroutableIds, TAP_SETTINGS_ROUTE, setTweakEnabledInText };', hostCtx)
-const { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, unroutableIds, TAP_SETTINGS_ROUTE, setTweakEnabledInText } = hostCtx.__host
+vm.runInContext(hostSource + '\n;globalThis.__host = { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, unroutableIds, TAP_SETTINGS_ROUTE, setTweakEnabledInText, patchTapWebPinText, tapIndexPath, TAP_WEBPIN_OLD, TAP_WEBPIN_NEW };', hostCtx)
+const { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, unroutableIds, TAP_SETTINGS_ROUTE, setTweakEnabledInText, patchTapWebPinText, tapIndexPath, TAP_WEBPIN_OLD, TAP_WEBPIN_NEW } = hostCtx.__host
 
 console.log('TWEAKS registry:')
 ok('is a non-empty frozen list', Array.isArray(TWEAKS) && TWEAKS.length > 0 && Object.isFrozen(TWEAKS))
@@ -126,6 +127,36 @@ check(
   setTweakEnabledInText('- id: other\n  config: {}\n', 'hideUnroutableModels', true),
   '- id: other\n  config: {}\n',
 )
+
+console.log('fixTapWebPin patch:')
+ok('fixTapWebPin is registered', TWEAKS.some((t) => t.id === 'fixTapWebPin'))
+const fixWebPin = TWEAKS.find((t) => t.id === 'fixTapWebPin')
+check('fixTapWebPin declares no loader target', fixWebPin.target, undefined)
+ok('fixTapWebPin opts into the menu', fixWebPin.menu === true)
+ok('fixTapWebPin has host apply/restore', typeof fixWebPin.apply === 'function' && typeof fixWebPin.restore === 'function')
+ok('OLD snippet carries the broken probe', TAP_WEBPIN_OLD.includes('searchProviderId') && TAP_WEBPIN_OLD.includes('fetchProviderId'))
+ok('NEW snippet reads the volatile config getters', TAP_WEBPIN_NEW.includes("config?.[field]?.get") && TAP_WEBPIN_NEW.includes('DSH_WEB_SEARCH_PROVIDER'))
+check(
+  'upstream text -> patched',
+  patchTapWebPinText(TAP_WEBPIN_OLD, true).state,
+  'patched',
+)
+check('upstream -> patched replaces the segment', patchTapWebPinText(TAP_WEBPIN_OLD, true).text, TAP_WEBPIN_NEW)
+check('already patched -> idempotent no-write', patchTapWebPinText(TAP_WEBPIN_NEW, true).state, 'patched')
+check('already patched -> text untouched', patchTapWebPinText(TAP_WEBPIN_NEW, true).text, TAP_WEBPIN_NEW)
+check('patched -> restore lands on upstream', patchTapWebPinText(TAP_WEBPIN_NEW, false).text, TAP_WEBPIN_OLD)
+check('already upstream -> restore idempotent', patchTapWebPinText(TAP_WEBPIN_OLD, false).state, 'upstream')
+check(
+  'foreign text -> unknown, untouched',
+  patchTapWebPinText('function hostReconcileView() {}\n', true),
+  { text: 'function hostReconcileView() {}\n', state: 'unknown' },
+)
+check(
+  'patch survives surrounding code (splice into a wrapper)',
+  patchTapWebPinText('before\n' + TAP_WEBPIN_OLD + '\nafter', true).text,
+  'before\n' + TAP_WEBPIN_NEW + '\nafter',
+)
+check('tapIndexPath returns null for a dshHome without profiles', tapIndexPath(join(root, 'test', 'no-such-home')), null)
 
 console.log('loader reconciliation:')
 const fakeEntry = {

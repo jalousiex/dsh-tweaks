@@ -29,7 +29,7 @@
  */
 
 import z from '@deepseek-ai/schemastery'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -90,6 +90,21 @@ export const TWEAKS = Object.freeze([
       '改完插件/配置后需要重启宿主；手动关托盘再开太绕。' +
       '注意：本项只登记意图与状态，真正的重启按钮由浏览器半渲染，' +
       '点击后调用 POST /dsh-tweaks/restart。',
+  },
+  {
+    id: 'fixTapWebPin',
+    title: '修复 dsh-tap「web 钉选」恒报宿主漂移（本机 node_modules 补丁）',
+    why:
+      'dsh-tap 0.20.0 的 webPin 对账探测 webService.searchProviderId/fetchProviderId——' +
+      '这两个实例字段在 dsh-web 的 WebRuntime 里不存在（真实值在 config volatile 字段' +
+      'searchProvider.get()/fetchProvider.get()），所以 CodeBuddy 卡的「宿主漂移」是常驻假 warn。' +
+      '开启 = 把 profiles\\desktop\\node_modules\\dsh-tap\\index.js 里的坏探测段原样替换成正确取值路径' +
+      '（幂等；已是修复版则跳过）。**重启 DSH 后生效**（hmr 不监听 node_modules）。' +
+      'dsh plugin add dsh-tap 重装/升级会冲掉补丁——本开关每次启动自动补回；' +
+      '若上游代码形态变了（对不上 OLD 片段），不动文件并在状态里如实报「形态不匹配」。',
+    menu: true,
+    apply: applyFixTapWebPin,
+    restore: restoreFixTapWebPin,
   },
 ])
 
@@ -195,6 +210,104 @@ function dshHomePath() {
 /** dsh-tap 设置卡自己的路由（GET 视图 / POST 动作共用同一个入口）。 */
 export const TAP_SETTINGS_ROUTE = '/dsh-tap/settings'
 
+// ── fixTapWebPin：给 dsh-tap 的 node_modules 副本打探测补丁 ────────────────
+// 不是路由类开关，也不动 Loader 条目：效果是磁盘文件补丁（幂等）。
+// 上游升级冲掉补丁时，本开关每次启动把它补回去；restore 还原上游原样。
+
+/**
+ * dsh-tap 0.20.0 的坏探测段（`dsh plugin add` 后的原始形态）。
+ * 补丁按「原样字符串替换」打：片段对不上 = 形态变了 = 不动 + 如实报状态。
+ */
+export const TAP_WEBPIN_OLD = `  try {
+    const sp = webService?.()?.searchProviderId
+    const fp = webService?.()?.fetchProviderId
+    if (sp !== undefined || fp !== undefined || webService?.()) {
+      out.webPin = { searchProvider: sp ?? null, fetchProvider: fp ?? null, ok: sp === 'codebuddy' && fp === 'codebuddy' }
+    }
+  } catch { out.webPin = null }`
+
+/** 补丁后的正确取值路径（与 dsh-web WebRuntime.search()/fetch() 同款）。 */
+export const TAP_WEBPIN_NEW = `  try {
+    // WebRuntime 取钉选的真实路径（search()/fetch() 同款）：config volatile 字段
+    // 现取 + env 覆盖兜底（$DSH_WEB_SEARCH_PROVIDER 优先级与 search() 内一致：
+    // config.get() ?? env）。实例上不存在 searchProviderId/fetchProviderId 字段。
+    const readPin = (field, envName) => {
+      const svc = webService?.()
+      if (!svc) return undefined
+      const getter = svc?.config?.[field]?.get
+      const configured = typeof getter === 'function' ? (() => { try { return getter.call(svc.config[field]) } catch { return undefined } })() : undefined
+      return configured ?? svc?.[field === 'searchProvider' ? 'searchProviderEnv' : 'fetchProviderEnv'] ?? process.env[envName]
+    }
+    const sp = readPin('searchProvider', 'DSH_WEB_SEARCH_PROVIDER')
+    const fp = readPin('fetchProvider', 'DSH_WEB_FETCH_PROVIDER')
+    if (sp !== undefined || fp !== undefined) {
+      out.webPin = { searchProvider: sp ?? null, fetchProvider: fp ?? null, ok: sp === 'codebuddy' && fp === 'codebuddy' }
+    }
+  } catch { out.webPin = null }`
+
+/**
+ * dsh-tap 的 node_modules 部署位置：`<DSH_HOME>\profiles\<profile>\node_modules\dsh-tap\index.js`。
+ * profile 目录名不硬编码——扫描 profiles\ 下带 node_modules\dsh-tap 的那个。
+ */
+export function tapIndexPath(dshHome) {
+  const home = dshHome || dshHomePath()
+  const profilesDir = join(home, 'profiles')
+  let candidates = []
+  try {
+    candidates = readdirSync(profilesDir).filter((name) => {
+      try { return statSync(join(profilesDir, name)).isDirectory() } catch { return false }
+    })
+  } catch {
+    return null
+  }
+  for (const name of candidates) {
+    const hit = join(profilesDir, name, 'node_modules', 'dsh-tap', 'index.js')
+    try {
+      if (statSync(hit).isFile()) return hit
+    } catch {}
+  }
+  return null
+}
+
+/**
+ * 纯函数（便于单测）：对 dsh-tap index.js 文本打/撤 webPin 补丁。
+ * 返回 `{ text, state }`；state ∈ 'patched'（已打上）| 'upstream'（已还原）| 'unknown'（形态对不上，原样返回）。
+ */
+export function patchTapWebPinText(text, apply_) {
+  const hasOld = text.includes(TAP_WEBPIN_OLD)
+  const hasNew = text.includes(TAP_WEBPIN_NEW)
+  if (apply_) {
+    if (hasNew) return { text, state: 'patched' }
+    if (!hasOld) return { text, state: 'unknown' }
+    return { text: text.split(TAP_WEBPIN_OLD).join(TAP_WEBPIN_NEW), state: 'patched' }
+  }
+  if (hasOld) return { text, state: 'upstream' }
+  if (!hasNew) return { text, state: 'unknown' }
+  return { text: text.split(TAP_WEBPIN_NEW).join(TAP_WEBPIN_OLD), state: 'upstream' }
+}
+
+/** fixTapWebPin 的「开」：把补丁写进 dsh-tap 的 index.js（已是修复版则不写）。 */
+export async function applyFixTapWebPin({ dshHome } = {}) {
+  const file = tapIndexPath(dshHome)
+  if (!file) throw new Error('找不到 dsh-tap 的 node_modules 部署（profiles\\*\\node_modules\\dsh-tap\\index.js）')
+  const before = readFileSync(file, 'utf8')
+  const { text, state } = patchTapWebPinText(before, true)
+  if (state === 'unknown') return { state, file, note: '上游代码形态变了，补丁对不上——未改动文件' }
+  if (text !== before) writeFileSync(file, text, 'utf8')
+  return { state, file, note: state === 'patched' && text !== before ? '已打补丁（重启 DSH 生效）' : '补丁已在位' }
+}
+
+/** fixTapWebPin 的「关」：还原 dsh-tap 上游原样（已是原样则不写）。 */
+export async function restoreFixTapWebPin({ dshHome } = {}) {
+  const file = tapIndexPath(dshHome)
+  if (!file) throw new Error('找不到 dsh-tap 的 node_modules 部署（profiles\\*\\node_modules\\dsh-tap\\index.js）')
+  const before = readFileSync(file, 'utf8')
+  const { text, state } = patchTapWebPinText(before, false)
+  if (state === 'unknown') return { state, file, note: '既非上游原样也非已知补丁形态——未改动文件' }
+  if (text !== before) writeFileSync(file, text, 'utf8')
+  return { state, file, note: state === 'upstream' && text !== before ? '已还原上游原样（重启 DSH 生效）' : '上游原样已在位' }
+}
+
 /** 「开之前是启用的」id 清单落盘位置（.cache 不进同步盘，属本机一次性状态）。 */
 function hideUnroutableStatePath() {
   return join(dshHomePath(), '.cache', 'dsh-tweaks', 'hide-unroutable.json')
@@ -298,8 +411,9 @@ export async function restoreHideUnroutable({ origin, stateFile }) {
   return { restored, failed }
 }
 
-/** 数据类改动的结果 → 状态路由里一句人话（null = 不写）。 */
+/** 数据类改动的结果 → 状态路由里一句人话（null = 不写）。结果自带 note 时优先用它。 */
 function describeDataResult(enabled, result) {
+  if (result && typeof result.note === 'string') return result.note
   if (!enabled) {
     const restored = Array.isArray(result && result.restored) ? result.restored : []
     const failed = Array.isArray(result && result.failed) ? result.failed : []
