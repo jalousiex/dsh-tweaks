@@ -57,6 +57,10 @@
 - **渲染**：侧边栏底部注入一条（兄弟块，与 `dsh-tap-quota` 同一套挂载方式：
   一次有界结构查询 + `childList` observer + `ResizeObserver` 管折叠轨道，
   **绝不 observe `class`、绝不整页扫描**）。`⟳` 在金额右侧（`margin-left:auto`），
+  **平时不可见，悬停余额行才出现**（用 `opacity` 隐藏并保留占位，悬停不横跳）。
+  它的外观、出现规则、转圈反馈、底色取自所在行背景，**与 `dsh-tap-quota` 的角标共用同一套规格**
+  （14×11、radius 3、11px、悬停 0.75 / 按下 1 / 禁用 0.3，底色走同一个自定义属性
+  `dsh-tap-quota:refresh-bg`；`dsh-tweaks/test/run.mjs` 逐项比对两边的 CSS，改一边忘了另一边会红）。
   点击 `stopPropagation` 只发一次请求。透明无底色 —— 与 `dsh-tap-quota` 的卡片观感一致。
 - **不显示企业套餐额度**：CodeBuddy/WorkBuddy 企业旗舰版在网页控制台显示的
   「月度限额 / 累积剩余」来自 **cookie 体系**，OAuth 不可达（见

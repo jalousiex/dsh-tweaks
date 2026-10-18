@@ -348,6 +348,23 @@ console.log('sidebarBalance（DSH 余额卡片）:')
   ok('balance 路由已注册', hostSource.includes('${ROUTE_PREFIX}/balance'))
   ok('路由受 statusRoute 把关', /statusRoute !== false/.test(hostSource))
   ok('读余额带硬性超时', /readBalance\(service, 6000\)/.test(hostSource))
+  // 余额行的 ⟳ 与 dsh-tap-quota 角标同一出现规则：平时不可见，悬停余额行才亮。
+  const balanceClient = readFileSync(join(root, 'lib', 'client.js'), 'utf8')
+  ok('余额行 ⟳ 默认不可见且不可点', /\.dtw-balance-btn\{[^}]*opacity:0/.test(balanceClient) && /\.dtw-balance-btn\{[^}]*pointer-events:none/.test(balanceClient))
+  ok('悬停余额行才显示 ⟳', /\.dtw-balance:hover \.dtw-balance-btn/.test(balanceClient))
+  ok('⟳ 用占位而非 display:none（悬停不横跳）', /\.dtw-balance-btn\{[^}]*margin-left:auto/.test(balanceClient) && !/\.dtw-balance-btn\{[^}]*display:none/.test(balanceClient))
+  // 两处刷新键统一外观：与 dsh-tap-quota 的 .qw-refresh 逐项对齐（尺寸/圆角/字号/各路 opacity）。
+  const quotaClient = readFileSync(join(root, '..', 'dsh-tap-quota', 'lib', 'client.js'), 'utf8')
+  const btnRule = (balanceClient.match(/\.dtw-balance-btn\{[^}]*\}/) || [''])[0]
+  const quotaRule = (quotaClient.match(/\.qw-refresh\{[^}]*\}/) || [''])[0]
+  const spec = (rule) => {
+    const pick = (prop) => (rule.match(new RegExp(prop.replace('|', '\\|') + ':([^;}]+)')) || [])[1]
+    return [pick('width'), pick('height'), pick('border-radius'), pick('font-size'), pick('color'), pick('opacity'), pick('transition')].join('|')
+  }
+  ok('刷新键与余量角标同一套外观规格', spec(btnRule) === spec(quotaRule) && /width:14px/.test(btnRule))
+  ok('悬停/禁用/高亮态一致', /\.dtw-balance-btn:hover\{opacity:1;/.test(balanceClient) && /\[disabled\]\{opacity:\.3/.test(balanceClient) && /:focus-visible\{outline:1px solid/.test(balanceClient))
+  ok('共用同一个底色自定义属性名', /REFRESH_BG = "dsh-tap-quota:refresh-bg"/.test(balanceClient) && /BG_KEY = "dsh-tap-quota:refresh-bg"/.test(quotaClient))
+  ok('刷新时同样转圈', /\.dtw-balance-btn\.busy>i\{animation:/.test(balanceClient) && /className = busy \? "dtw-balance-btn busy"/.test(balanceClient))
 }
 
 console.log('describeSubject (对象状态):')
