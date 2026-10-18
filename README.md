@@ -1,4 +1,7 @@
-# dsh-tweaks
+# dsh-tweaks（小开关）
+
+> **小开关** —— 一组可单独开关的小改动：隐藏内置供应商、过滤不可路由模型、修复
+> dsh-tap 假告警、侧边栏显示 DSH 余额。开关随 profile 跨机器同步，每条都带依据说明。
 
 一组**可单独开关**的小改动，为 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) 服务。
 
