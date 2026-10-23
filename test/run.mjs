@@ -9,8 +9,8 @@
  *   - browser half: lib/client.js evaluated against a fake __ModuleLoader__.
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import vm from 'node:vm'
@@ -19,19 +19,7 @@ import { createRequire } from 'node:module'
 const here = dirname(fileURLToPath(import.meta.url))
 const root = join(here, '..')
 
-// `yaml` 是宿主半的真实依赖（写 ③ 前做解析校验）；vm 里必须给同一个实例。
-// 独立跑测试时本包未必装了依赖，所以按「包内 → profile node_modules」顺序找。
 const require_ = createRequire(import.meta.url)
-function loadYaml() {
-  const candidates = [
-    join(root, 'node_modules', 'yaml'),
-    join(homedir(), '.dsh', 'profiles', 'desktop', 'node_modules', 'yaml'),
-  ]
-  for (const spec of candidates) {
-    try { return require_(spec) } catch {}
-  }
-  throw new Error('找不到 yaml（先 pnpm i 或用 NODE_PATH 指向 profile node_modules）')
-}
 function loadSchemastery() {
   const candidates = [
     join(root, 'node_modules', '@deepseek-ai', 'schemastery'),
@@ -42,7 +30,6 @@ function loadSchemastery() {
   }
   return null
 }
-const YAML = loadYaml()
 // 有真 schemastery 就用它（宿主半能按真 schema 构造），没有就退回空桩：
 // 纯函数断言照样能跑，只有依赖 schema 求值的部分会退化。
 const Schemastery = loadSchemastery()
@@ -70,10 +57,6 @@ const hostSource = readFileSync(join(root, 'index.js'), 'utf8')
     /^import z from '@deepseek-ai\/schemastery'$/m,
     Schemastery ? 'const z = hostZ;' : 'const z = new Proxy(function () {}, { get: () => z, apply: () => z })',
   )
-  .replace(
-    /^import YAML from 'yaml'$/m,
-    'const YAML = hostYaml;',
-  )
   .replace(/^import .*$/gm, '')
   .replace(/^export /gm, '')
 
@@ -86,18 +69,19 @@ const hostCtx = {
   join,
   dirname,
   homedir,
-  readdirSync,
-  statSync,
-  hostYaml: YAML,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  readFileSync,
+  writeFileSync,
   hostZ: Schemastery ? Schemastery.default || Schemastery : undefined,
-  // readBalance 用到 Promise / Symbol / Intl（超时竞速与本地化）
   Promise,
   Symbol,
   Intl,
 }
 vm.createContext(hostCtx)
-vm.runInContext(hostSource + '\n;globalThis.__host = { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, unroutableIds, TAP_SETTINGS_ROUTE, setTweakEnabledInText, tweakIsPresentInPatch, validatePatchText, describeSubject, patchTapWebPinText, tapIndexPath, TAP_WEBPIN_OLD, TAP_WEBPIN_NEW, Config, normalizeBalance, readBalance, accountClientMetadata };', hostCtx)
-const { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, unroutableIds, TAP_SETTINGS_ROUTE, setTweakEnabledInText, tweakIsPresentInPatch, validatePatchText, describeSubject, patchTapWebPinText, tapIndexPath, TAP_WEBPIN_OLD, TAP_WEBPIN_NEW, Config, normalizeBalance, readBalance, accountClientMetadata } = hostCtx.__host
+vm.runInContext(hostSource + '\n;globalThis.__host = { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, describeSubject, Config, statePath, readState, writeState };', hostCtx)
+const { TWEAKS, isEnabled, describeTweaks, checkTarget, findEntry, disableEntry, restoreEntry, describeSubject, Config, statePath, readState, writeState } = hostCtx.__host
 
 console.log('TWEAKS registry:')
 ok('is a non-empty frozen list', Array.isArray(TWEAKS) && TWEAKS.length > 0 && Object.isFrozen(TWEAKS))
@@ -106,149 +90,65 @@ ok(
   'ids are unique',
   new Set(TWEAKS.map((t) => t.id)).size === TWEAKS.length,
 )
-ok('hideSettingsModels is gone (it disabled the whole 模型 settings section)', !TWEAKS.some((t) => t.id === 'hideSettingsModels'))
-ok('hideUnroutableModels is registered', TWEAKS.some((t) => t.id === 'hideUnroutableModels'))
-ok('fixTapWebPin is registered', TWEAKS.some((t) => t.id === 'fixTapWebPin'))
+ok('hideBuiltinDeepseek is registered', TWEAKS.some((t) => t.id === 'hideBuiltinDeepseek'))
+ok('hideUnroutableModels is gone', !TWEAKS.some((t) => t.id === 'hideUnroutableModels'))
+ok('fixTapWebPin is gone', !TWEAKS.some((t) => t.id === 'fixTapWebPin'))
+ok('sidebarBalance is gone', !TWEAKS.some((t) => t.id === 'sidebarBalance'))
 
 console.log('tweaks targets:')
 check('hideBuiltinDeepseek targets the built-in provider', TWEAKS.find((t) => t.id === 'hideBuiltinDeepseek').target, 'llm-deepseek')
 check('no tweak targets the settings models entry', TWEAKS.some((t) => t.target === 'ui-settings-models'), false)
-const hideUnroutable = TWEAKS.find((t) => t.id === 'hideUnroutableModels')
-check('hideUnroutableModels declares no loader target', hideUnroutable.target, undefined)
-ok('hideUnroutableModels opts into the menu', hideUnroutable.menu === true)
-ok('hideUnroutableModels has a host apply', typeof hideUnroutable.apply === 'function')
-ok('hideUnroutableModels has a host restore', typeof hideUnroutable.restore === 'function')
+ok('every tweak declares a loader target', TWEAKS.every((t) => typeof t.target === 'string' && t.target))
+ok('no tweak carries apply/restore (only entry-disabling tweaks remain)', TWEAKS.every((t) => typeof t.apply !== 'function' && typeof t.restore !== 'function'))
 
-console.log('unroutableIds:')
-check('tweak route is dsh-tap settings', TAP_SETTINGS_ROUTE, '/dsh-tap/settings')
-check('no view -> empty', unroutableIds(null), [])
-check(
-  'only catalog-present ids count',
-  unroutableIds({
-    catalog: { models: [{ id: 'glm-4.6v' }, { id: 'hy4-preview' }] },
-    unroutable: { 'glm-4.6v': 'dead', 'hy4-preview-x': 'gone from catalog' },
-  }),
-  ['glm-4.6v'],
-)
-check(
-  'all present ids are listed',
-  unroutableIds({
-    catalog: { models: [{ id: 'a' }, { id: 'b' }, { id: 'c' }] },
-    unroutable: { a: 'x', b: 'y' },
-  }),
-  ['a', 'b'],
-)
-check(
-  'view without unroutable table -> empty',
-  unroutableIds({ catalog: { models: [{ id: 'a' }] } }),
-  [],
-)
+console.log('Config schema (基础设施参数；开关不进 Config):')
+ok('Config is defined', typeof Config !== 'undefined')
+// 关键：开关**不能**在 Config 里 —— 否则 settings.update 会触发条目热重载，
+// 客户端分区被销毁重建（「点一下开关，内容消失」的根因）。
+for (const t of TWEAKS) {
+  ok(t.id + ' is NOT a Config field', !Config.dict?.[t.id])
+}
+// 基础设施参数仍在 Config，且都不带 volatile（避免被投影成第二个写入者）。
+ok('statusRoute exists', Boolean(Config.dict?.statusRoute))
+ok('statusRoute is not volatile', Config.dict?.statusRoute?.meta?.volatile !== true)
+ok('no volatile fields in Config at all', !Object.values(Config.dict || {}).some((f) => f?.meta?.volatile === true))
+ok('no dataRetry (数据类改动已剥离)', !Config.dict?.dataRetry)
+ok('no nested tweaks dict', !/tweaks:\s*z\.dict/.test(hostSource))
 
-const patchText = [
-  '- id: dsh-tweaks',
-  '  name: "dsh-tweaks"',
-  '  config:',
-  '    tweaks:',
-  '      hideUnroutableModels:',
-  '        enabled: true        # 目录在列但不可路由',
-  '      restartButton:',
-  '        enabled: false',
-  '- id: web',
-].join('\n')
-check(
-  'toggle rewrites the boolean',
-  setTweakEnabledInText(patchText, 'hideUnroutableModels', false).includes('        enabled: false        # 目录在列但不可路由'),
-  true,
-)
-check(
-  'toggle keeps the trailing comment of the sibling it does not touch',
-  setTweakEnabledInText(patchText, 'restartButton', true).includes('        enabled: true'),
-  true,
-)
-check(
-  'toggle leaves the text alone for an unknown tweak',
-  setTweakEnabledInText(patchText, 'nope', true),
-  patchText,
-)
-check(
-  'toggle leaves the text alone without a dsh-tweaks row',
-  setTweakEnabledInText('- id: other\n  config: {}\n', 'hideUnroutableModels', true),
-  '- id: other\n  config: {}\n',
-)
-
-console.log('validatePatchText (写 ③ 前的解析闸门):')
-check('valid patch -> ok', validatePatchText('- id: a\n  config: {}\n').ok, true)
-// 复刻本机 ③ 曾经出现过的真实故障：键缺冒号 → 整层不可解析。
-const brokenPatch = [
-  '- id: dsh-tweaks',
-  '  name: "dsh-tweaks"',
-  '  config:',
-  '    tweaks:',
-  '      hideUnroutableModels',
-  '        enabled: true',
-].join('\n')
-check('missing colon -> not ok', validatePatchText(brokenPatch).ok, false)
-ok('missing colon -> reason names YAML', validatePatchText(brokenPatch).error.includes('YAML'))
-ok('missing colon -> reason carries a line number', /\(line \d+\)/.test(validatePatchText(brokenPatch).error))
-check(
-  'a valid toggle result still validates',
-  validatePatchText(setTweakEnabledInText(patchText, 'restartButton', true)).ok,
-  true,
-)
+console.log('开关状态文件（切换不碰 Config/patch）:')
+ok('statePath points into .cache', /statePath/.test(hostSource) && /\.cache['"],\s*'dsh-tweaks'/.test(hostSource))
+ok('readState exists', /function readState/.test(hostSource))
+ok('writeState exists', /function writeState/.test(hostSource))
+ok('writeState uses atomic rename', /renameSync\(tmp, file\)/.test(hostSource))
+// toggle 必须写状态文件 + 就地重跑，绝不调 settings.update。
+ok('toggle writes the state file', /writeState\(undefined, next\)/.test(hostSource))
+ok('toggle reconciles in place', /reconcileAll\(\)/.test(hostSource))
+ok('toggle does NOT call settings.update', !/svc\.update\(name/.test(hostSource))
+ok('toggle does NOT write cordis.patch.yml', !/writeFileSync\(file, after/.test(hostSource))
+ok('reconcileAll disposes old effects first', /disposeTweak\(tweak\.id\)/.test(hostSource))
 
 console.log('Config tunables (官方：无硬编码可调参数):')
-// schemastery 的 schema 读默认值的接口随版本变动，这里做稳定的静态断言：
-// 每个可调参数都必须在 Config 里声明，且带默认值。
-ok('dataRetry declared with defaults', /dataRetry:\s*z\.object\(\{[\s\S]*?attempts:\s*z\.number\(\)\.default\(8\)[\s\S]*?intervalMs:\s*z\.number\(\)\.default\(2000\)/.test(hostSource))
 ok('reassertLimit declared with default 10', /reassertLimit:\s*z\.number\(\)\.default\(10\)/.test(hostSource))
 ok('fallbackReconcileMs defaults to 0 (event-driven, no polling)', /fallbackReconcileMs:\s*z\.number\(\)\.default\(0\)/.test(hostSource))
 ok('statusRefreshMs declared with default', /statusRefreshMs:\s*z\.number\(\)\.default\(600000\)/.test(hostSource))
 ok('statusRoute still defaults on', /statusRoute:\s*z\.boolean\(\)\.default\(true\)/.test(hostSource))
-ok('apply() re-arms the retry/interval from config, not literals', /positiveInt\(config\?\.dataRetry\?\.attempts, 8\)/.test(hostSource) && /nonNegativeInt\(config\?\.dataRetry\?\.intervalMs, 2000\)/.test(hostSource))
-// 这一 schemastery 版本的嵌套容器默认值必须是「值」；写成函数会让
-// 「配置里没写 tweaks / dataRetry」直接校验失败、插件起不来。
-ok('tweaks default is a value, not a thunk', /tweaks:[\s\S]*?\}\)\.default\(\{\}\)/.test(hostSource) && !/tweaks:[\s\S]{0,120}\.default\(\(\) =>/.test(hostSource))
-ok('dataRetry default is a value, not a thunk', /dataRetry:[\s\S]{0,200}\.default\(\{\}\)/.test(hostSource) && !/dataRetry:[\s\S]{0,200}\.default\(\(\) =>/.test(hostSource))
+ok('apply() re-arms reassert/refresh from config, not literals', /positiveInt\(config\?\.reassertLimit, 10\)/.test(hostSource) && /nonNegativeInt\(config\?\.fallbackReconcileMs, 0\)/.test(hostSource))
 
 console.log('event-driven reconcile (no polling):')
 ok('reconcile listens to app-boot/config-reload', hostSource.includes("ctx.on('app-boot/config-reload'"))
 ok('reconcile listens to plugin-manager/changed', hostSource.includes("ctx.on('plugin-manager/changed'"))
 ok('no unconditional 3s polling', !/setInterval\(tick,\s*3000\)/.test(hostSource))
 ok('fallback interval is opt-in via config', /fallbackMs > 0 \? setInterval/.test(hostSource))
-ok('no hardcoded retry literals', !/attempt\(8\)/.test(hostSource) && !/attempt\(left - 1\) \}, 2000\)/.test(hostSource))
 ok('no hardcoded reassert ceiling', !/reasserts >= 10/.test(hostSource))
-ok('toggle route validates before writing', /validatePatchText\(after\)/.test(hostSource))
-ok('toggle route refuses to write an already-broken file', /validatePatchText\(before\)/.test(hostSource))
 
-console.log('fixTapWebPin patch:')
-ok('fixTapWebPin is registered', TWEAKS.some((t) => t.id === 'fixTapWebPin'))
-const fixWebPin = TWEAKS.find((t) => t.id === 'fixTapWebPin')
-check('fixTapWebPin declares no loader target', fixWebPin.target, undefined)
-ok('fixTapWebPin opts into the menu', fixWebPin.menu === true)
-ok('fixTapWebPin has host apply/restore', typeof fixWebPin.apply === 'function' && typeof fixWebPin.restore === 'function')
-ok('OLD snippet carries the broken probe', TAP_WEBPIN_OLD.includes('searchProviderId') && TAP_WEBPIN_OLD.includes('fetchProviderId'))
-ok('NEW snippet reads the volatile config getters', TAP_WEBPIN_NEW.includes("config?.[field]?.get") && TAP_WEBPIN_NEW.includes('DSH_WEB_SEARCH_PROVIDER'))
-check(
-  'upstream text -> patched',
-  patchTapWebPinText(TAP_WEBPIN_OLD, true).state,
-  'patched',
-)
-check('upstream -> patched replaces the segment', patchTapWebPinText(TAP_WEBPIN_OLD, true).text, TAP_WEBPIN_NEW)
-check('already patched -> idempotent no-write', patchTapWebPinText(TAP_WEBPIN_NEW, true).state, 'patched')
-check('already patched -> text untouched', patchTapWebPinText(TAP_WEBPIN_NEW, true).text, TAP_WEBPIN_NEW)
-check('patched -> restore lands on upstream', patchTapWebPinText(TAP_WEBPIN_NEW, false).text, TAP_WEBPIN_OLD)
-check('already upstream -> restore idempotent', patchTapWebPinText(TAP_WEBPIN_OLD, false).state, 'upstream')
-check(
-  'foreign text -> unknown, untouched',
-  patchTapWebPinText('function hostReconcileView() {}\n', true),
-  { text: 'function hostReconcileView() {}\n', state: 'unknown' },
-)
-check(
-  'patch survives surrounding code (splice into a wrapper)',
-  patchTapWebPinText('before\n' + TAP_WEBPIN_OLD + '\nafter', true).text,
-  'before\n' + TAP_WEBPIN_NEW + '\nafter',
-)
-check('tapIndexPath returns null for a dshHome without profiles', tapIndexPath(join(root, 'test', 'no-such-home')), null)
+console.log('toggle route（写状态文件 + 就地重跑，不触发条目重载）:')
+ok('toggle route exists', hostSource.includes('${ROUTE_PREFIX}/toggle'))
+ok('no YAML import', !/^import YAML/m.test(hostSource))
+ok('no settings dependency for toggling', !/ctx\.inject\(\['settings'\]/.test(hostSource))
+ok('no /balance route (sidebarBalance 已剥离)', !hostSource.includes('${ROUTE_PREFIX}/balance'))
+ok('no deepseekAccount usage', !/deepseekAccount/.test(hostSource))
+ok('no dsh-tap references', !/dsh-tap/.test(hostSource))
+ok('no webPin patch leftovers', !/TAP_WEBPIN/.test(hostSource) && !/patchTapWebPin/.test(hostSource))
 
 console.log('loader reconciliation:')
 const fakeEntry = {
@@ -294,78 +194,6 @@ ok(
   TWEAKS.every((t) => ['entry', 'plugin', 'file', 'host'].includes(t.subject.kind)),
 )
 check('hideBuiltinDeepseek acts on a loader entry', TWEAKS.find((t) => t.id === 'hideBuiltinDeepseek').subject.kind, 'entry')
-check('hideUnroutableModels acts on a plugin', TWEAKS.find((t) => t.id === 'hideUnroutableModels').subject.kind, 'plugin')
-check('fixTapWebPin acts on a file', TWEAKS.find((t) => t.id === 'fixTapWebPin').subject.kind, 'file')
-check('sidebarBalance acts on the host account service', TWEAKS.find((t) => t.id === 'sidebarBalance').subject.kind, 'host')
-check('sidebarBalance names deepseekAccount', TWEAKS.find((t) => t.id === 'sidebarBalance').subject.name, 'deepseekAccount')
-
-console.log('sidebarBalance（DSH 余额卡片）:')
-{
-  const t = TWEAKS.find((x) => x.id === 'sidebarBalance')
-  ok('已登记并在菜单里出现', t.menu === true)
-  ok('why 说明数据源与迁移理由', /deepseekAccount|getBalance/.test(t.why) && /dsh-tap-quota|不同源|迁/.test(t.why))
-  ok('why 明确不含企业套餐额度', /R-Q10|cookie/.test(t.why))
-  // 归一化：金额是字符串，原样保留；充值与赠金分开；只收 CNY/USD。
-  check('未登录 -> signed-out', normalizeBalance(null), { ok: false, error: 'signed-out', wallets: [], bonusWallets: [] })
-  check('读取失败 -> read-failed', normalizeBalance({ status: 'failed' }).error, 'read-failed')
-  check(
-    'ready：只留 CNY/USD，金额原样（不转 Number）',
-    normalizeBalance({
-      status: 'ready',
-      value: [{ currency: 'CNY', balance: '0.2599924800000000' }, { currency: 'JPY', balance: '9' }],
-      bonusWallets: [{ currency: 'CNY', balance: '5' }],
-    }),
-    { ok: true, wallets: [{ currency: 'CNY', balance: '0.2599924800000000' }], bonusWallets: [{ currency: 'CNY', balance: '5' }] },
-  )
-  check(
-    '非字符串余额被丢弃（不猜 0）',
-    normalizeBalance({ status: 'ready', value: [{ currency: 'CNY', balance: 12.34 }], bonusWallets: [] }),
-    { ok: true, wallets: [], bonusWallets: [] },
-  )
-  // 服务不在 -> readBalance 返回 null（调用方据此渲染 missing）。
-  const absent = await readBalance(null)
-  check('服务不在 -> null', absent, null)
-  // 服务在但两个方法都缺失：不抛错，如实给出 signed-out + read-failed。
-  const bare = await readBalance({})
-  check('无 getBalance/getState 时不抛错', bare.balance.ok, false)
-  check('无 getState 时 signedIn=false', bare.signedIn, false)
-  // 正常路径（假服务）。
-  const fake = {
-    getState: async () => ({ status: 'credential-stored' }),
-    getBalance: async () => ({ status: 'ready', value: [{ currency: 'CNY', balance: '12.34' }], bonusWallets: [] }),
-  }
-  const good = await readBalance(fake)
-  check('正常读取：登录态 + 余额', [good.signedIn, good.balance.wallets[0].balance], [true, '12.34'])
-  // 余额抛错但登录态正常：不该把 signedIn 也拖没。
-  const halfBroken = {
-    getState: async () => ({ status: 'credential-stored' }),
-    getBalance: async () => { throw new Error('boom') },
-  }
-  const partial = await readBalance(halfBroken)
-  check('余额失败不影响登录态', partial.signedIn, true)
-  check('余额失败如实标 read-failed', partial.balance.error, 'read-failed')
-  // 宿主侧路由与配置。
-  ok('balance 路由已注册', hostSource.includes('${ROUTE_PREFIX}/balance'))
-  ok('路由受 statusRoute 把关', /statusRoute !== false/.test(hostSource))
-  ok('读余额带硬性超时', /readBalance\(service, 6000\)/.test(hostSource))
-  // 余额行的 ⟳ 与 dsh-tap-quota 角标同一出现规则：平时不可见，悬停余额行才亮。
-  const balanceClient = readFileSync(join(root, 'lib', 'client.js'), 'utf8')
-  ok('余额行 ⟳ 默认不可见且不可点', /\.dtw-balance-btn\{[^}]*opacity:0/.test(balanceClient) && /\.dtw-balance-btn\{[^}]*pointer-events:none/.test(balanceClient))
-  ok('悬停余额行才显示 ⟳', /\.dtw-balance:hover \.dtw-balance-btn/.test(balanceClient))
-  ok('⟳ 用占位而非 display:none（悬停不横跳）', /\.dtw-balance-btn\{[^}]*margin-left:auto/.test(balanceClient) && !/\.dtw-balance-btn\{[^}]*display:none/.test(balanceClient))
-  // 两处刷新键统一外观：与 dsh-tap-quota 的 .qw-refresh 逐项对齐（尺寸/圆角/字号/各路 opacity）。
-  const quotaClient = readFileSync(join(root, '..', 'dsh-tap-quota', 'lib', 'client.js'), 'utf8')
-  const btnRule = (balanceClient.match(/\.dtw-balance-btn\{[^}]*\}/) || [''])[0]
-  const quotaRule = (quotaClient.match(/\.qw-refresh\{[^}]*\}/) || [''])[0]
-  const spec = (rule) => {
-    const pick = (prop) => (rule.match(new RegExp(prop.replace('|', '\\|') + ':([^;}]+)')) || [])[1]
-    return [pick('width'), pick('height'), pick('border-radius'), pick('font-size'), pick('color'), pick('opacity'), pick('transition')].join('|')
-  }
-  ok('刷新键与余量角标同一套外观规格', spec(btnRule) === spec(quotaRule) && /width:14px/.test(btnRule))
-  ok('悬停/禁用/高亮态一致', /\.dtw-balance-btn:hover\{opacity:1;/.test(balanceClient) && /\[disabled\]\{opacity:\.3/.test(balanceClient) && /:focus-visible\{outline:1px solid/.test(balanceClient))
-  ok('共用同一个底色自定义属性名', /REFRESH_BG = "dsh-tap-quota:refresh-bg"/.test(balanceClient) && /BG_KEY = "dsh-tap-quota:refresh-bg"/.test(quotaClient))
-  ok('刷新时同样转圈', /\.dtw-balance-btn\.busy>i\{animation:/.test(balanceClient) && /className = busy \? "dtw-balance-btn busy"/.test(balanceClient))
-}
 
 console.log('describeSubject (对象状态):')
 const entryTweak = TWEAKS.find((t) => t.id === 'hideBuiltinDeepseek')
@@ -375,18 +203,31 @@ check('absent entry -> missing', describeSubject(entryTweak, undefined, true, { 
 check('switch off -> idle', describeSubject(entryTweak, { disabled: true }, false, undefined).status, 'idle')
 check('apply error -> mismatch', describeSubject(entryTweak, { disabled: true }, true, { ok: false, error: 'boom' }).status, 'mismatch')
 ok('missing carries a human reason', describeSubject(entryTweak, undefined, true, { ok: true }).label.includes('Loader'))
-const fileTweak = TWEAKS.find((t) => t.id === 'fixTapWebPin')
-check('file kind resolves against this machine', ['ready', 'missing'].includes(describeSubject(fileTweak, undefined, true, { ok: true }).status), true)
 
-console.log('isEnabled:')
-check('unknown config -> false', isEnabled({}, 'hideBuiltinDeepseek'), false)
-check('missing tweaks -> false', isEnabled({ tweaks: undefined }, 'x'), false)
-check('explicit false -> false', isEnabled({ tweaks: { a: { enabled: false } } }, 'a'), false)
-check('explicit true -> true', isEnabled({ tweaks: { a: { enabled: true } } }, 'a'), true)
-check('truthy non-boolean is not enough', isEnabled({ tweaks: { a: { enabled: 'yes' } } }, 'a'), false)
+console.log('isEnabled (state[ id ] === true):')
+check('unknown state -> false', isEnabled({}, 'hideBuiltinDeepseek'), false)
+check('explicit false -> false', isEnabled({ hideBuiltinDeepseek: false }, 'hideBuiltinDeepseek'), false)
+check('explicit true -> true', isEnabled({ hideBuiltinDeepseek: true }, 'hideBuiltinDeepseek'), true)
+check('truthy non-boolean is not enough', isEnabled({ hideBuiltinDeepseek: 'yes' }, 'hideBuiltinDeepseek'), false)
+check('null state -> false', isEnabled(null, 'hideBuiltinDeepseek'), false)
+
+console.log('readState / writeState（状态文件读写）:')
+{
+  const tmpHome = join(root, 'test', 'tmp-state-home')
+  try { rmSync(tmpHome, { recursive: true, force: true }) } catch {}
+  check('missing file -> all false', readState(tmpHome), Object.fromEntries(TWEAKS.map((t) => [t.id, false])))
+  const next = { ...Object.fromEntries(TWEAKS.map((t) => [t.id, false])), hideBuiltinDeepseek: true }
+  ok('writeState succeeds', writeState(tmpHome, next) === true)
+  check('readState round-trips', readState(tmpHome), next)
+  ok('state file is under .cache/dsh-tweaks', readFileSync(statePath(tmpHome), 'utf8').includes('hideBuiltinDeepseek'))
+  // 损坏文件不抛、当全关
+  writeFileSync(statePath(tmpHome), 'not json', 'utf8')
+  check('corrupt file -> all false (no throw)', readState(tmpHome), Object.fromEntries(TWEAKS.map((t) => [t.id, false])))
+  try { rmSync(tmpHome, { recursive: true, force: true }) } catch {}
+}
 
 console.log('describeTweaks:')
-const described = describeTweaks({ tweaks: { hideBuiltinDeepseek: { enabled: true } } }, new Map())
+const described = describeTweaks({ hideBuiltinDeepseek: true }, new Map())
 check('one row per tweak', described.length, TWEAKS.length)
 const row = described.find((r) => r.id === 'hideBuiltinDeepseek')
 ok('reflects enabled flag', row.enabled === true)
@@ -408,8 +249,23 @@ ok('target missing -> reason names the target', checkTarget('gone', []).reason.i
 // ── browser half ─────────────────────────────────────────────────────────
 const clientSource = readFileSync(join(root, 'lib', 'client.js'), 'utf8')
 let def = null
+// fetch 桩：让 toggle() 能在测试里真的跑一遍（抓未定义常量这类运行时错）。
+const fetchCalls = []
 const clientCtx = {
   console,
+  setTimeout,
+  clearTimeout,
+  setInterval,
+  clearInterval,
+  fetch: (url, opts) => {
+    fetchCalls.push({ url: String(url), method: opts && opts.method, body: opts && opts.body })
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve(JSON.stringify({ ok: true, id: 'hideBuiltinDeepseek', enabled: false })),
+      json: () => Promise.resolve({ tweaks: [{ id: 'hideBuiltinDeepseek', target: 'llm-deepseek', enabled: false }] }),
+    })
+  },
   window: {
     __ModuleLoader__: {
       load(d) {
@@ -439,165 +295,104 @@ check(
   1,
 )
 check(
-  'readTweaks includes a tweak that only has an action',
-  api.readTweaks({ tweaks: [{ id: 'sidebarBalance', menu: true, enabled: true }] }).rows.length,
-  1,
-)
-check(
   'readTweaks ignores unknown ids',
   api.readTweaks({ tweaks: [{ id: 'nope', target: null, enabled: true }] }).rows.length,
   0,
 )
-check(
-  'readTweaks honors the menu flag for data tweaks',
-  api.readTweaks({ tweaks: [{ id: 'hideUnroutableModels', target: null, menu: true, enabled: true }] }).rows.length,
-  1,
-)
-ok(
-  'readTweaks reports the hideUnroutable state',
-  api.readTweaks({ tweaks: [{ id: 'hideUnroutableModels', menu: true, enabled: true }] }).hideUnroutable === true,
-)
-ok(
-  'readTweaks defaults hideUnroutable to false',
-  api.readTweaks({ tweaks: [] }).hideUnroutable === false,
-)
-ok('hide CSS hides unroutable rows', api.HIDE_UNROUTABLE_CSS.includes('.cbc-listrow.cbc-unroutable{display:none!important}'))
-ok('hide CSS collapses an all-dead group title', api.HIDE_UNROUTABLE_CSS.includes('p.cbc-subtitle:not(:has('))
-ok('hide CSS is off while the tweak is off', !api.styleText().includes('cbc-unroutable'))
-ok('card CSS is always present', api.styleText().includes('.dtw-card'))
-ok('page CSS carries the tap quick-filter row', api.styleText().length > 0 && clientSource.includes('dtw-taprow'))
 
 console.log('卡片字段（启用状态/描述/生效对象/对象状态/生效条件）:')
 const cardRow = api.readTweaks({
   tweaks: [{
-    id: 'hideUnroutableModels',
-    menu: true,
+    id: 'hideBuiltinDeepseek',
+    target: 'llm-deepseek',
     enabled: true,
-    title: '剔掉死模型',
-    what: '把路由不通的模型摘掉',
+    title: '隐藏内置供应商',
+    what: '模型列表里只留「DeepSeek 账号」',
     why: '为什么',
-    subjectKind: 'plugin',
-    subjectLabel: 'dsh-tap（CodeBuddy 网关）',
-    subjectStatus: 'ready',
-    subjectStatusLabel: '插件在位，它的设置路由可用',
-    effect: '调它自己的设置路由',
-    appliesWhen: 'dsh-tap 已安装且设置路由已注册',
-    note: '已从选择器移除 1 个',
+    subjectKind: 'entry',
+    subjectLabel: '内置 DeepSeek 供应商',
+    subjectStatus: 'disabled',
+    subjectStatusLabel: '条目在位，已被本开关禁用',
+    effect: '禁用该条目',
+    appliesWhen: '该条目在当前 profile 里存在',
   }],
 }).rows[0]
-check('carries title', cardRow.title, '剔掉死模型')
-check('carries what (描述)', cardRow.what, '把路由不通的模型摘掉')
-check('carries subjectKind (生效对象类型)', cardRow.subjectKind, 'plugin')
-check('carries subjectLabel (生效对象)', cardRow.subjectLabel, 'dsh-tap（CodeBuddy 网关）')
-check('carries subjectStatus (对象状态)', cardRow.subjectStatus, 'ready')
-ok('carries subjectStatusLabel', cardRow.subjectStatusLabel.includes('设置路由'))
-check('carries appliesWhen (生效条件)', cardRow.appliesWhen, 'dsh-tap 已安装且设置路由已注册')
+check('carries title', cardRow.title, '隐藏内置供应商')
+check('carries what (描述)', cardRow.what, '模型列表里只留「DeepSeek 账号」')
+check('carries subjectKind (生效对象类型)', cardRow.subjectKind, 'entry')
+check('carries subjectLabel (生效对象)', cardRow.subjectLabel, '内置 DeepSeek 供应商')
+check('carries subjectStatus (对象状态)', cardRow.subjectStatus, 'disabled')
+ok('carries subjectStatusLabel', cardRow.subjectStatusLabel.includes('已被本开关禁用'))
+check('carries appliesWhen (生效条件)', cardRow.appliesWhen, '该条目在当前 profile 里存在')
 ok('carries enabled (启用状态)', cardRow.enabled === true)
-const bareRow = api.readTweaks({ tweaks: [{ id: 'x', menu: true, enabled: false }] }).rows[0]
+const bareRow = api.readTweaks({ tweaks: [{ id: 'x', target: 'y', enabled: false }] }).rows[0]
 check('missing fields degrade safely', [bareRow.what, bareRow.subjectKind, bareRow.subjectLabel], ['', '', ''])
 check('unknown subject status degrades safely', bareRow.subjectStatus, 'unknown')
+
+console.log('入口划分（补丁开关在 settings.section，插件页只读）:')
+ok('registers settings.section', /slots\.inject\("settings\.section"/.test(clientSource))
+ok('section id is a short slug', /id: SECTION_ID/.test(clientSource) && /SECTION_ID = "tweaks"/.test(clientSource))
+ok('section label is 增强补丁', /label: function \(\) \{ return "增强补丁"; \}/.test(clientSource))
+ok('TweakCard keeps an interactive checkbox', /type: "checkbox"/.test(clientSource))
+ok('checkbox toggles the tweak', /onChange: function \(e\) \{ toggle\(row\.id, e\.target\.checked\); \}/.test(clientSource))
+ok('registers plugins.bundle.config with read-only info', /slots\.inject\("plugins\.bundle\.config"/.test(clientSource) && /\}, PluginInfo\);/.test(clientSource))
+ok('PluginInfo explains why switches moved', /改开关会触发插件重载/.test(clientSource))
+// 回归：toggle() 必须真的能跑通。
+{
+  let threw = null
+  try {
+    await api.toggle('hideBuiltinDeepseek', false)
+  } catch (e) {
+    threw = e
+  }
+  ok('toggle() runs without throwing', threw === null)
+  const first = fetchCalls[0]
+  ok('toggle() POSTs to /dsh-tweaks/toggle', first && first.method === 'POST' && first.url === '/dsh-tweaks/toggle')
+  check('toggle() body carries id + enabled', first && JSON.parse(first.body), { id: 'hideBuiltinDeepseek', enabled: false })
+  ok('toggle() polls /dsh-tweaks/status afterwards', fetchCalls.some((c) => c.url === '/dsh-tweaks/status'))
+}
 
 console.log('侧边栏入口（已撤销，记录原因）:')
 ok('no longer registers sidebar.footer.action', !clientSource.includes('ctx.slots.inject("sidebar.footer.action"'))
 ok('no dead sidebar component or slot id', !clientSource.includes('SidebarRestart') && !clientSource.includes('RESTART_SLOT_ID'))
 ok('header records why the sidebar entry was dropped', clientSource.includes('那一行与 dsh-tap-quota 的余额卡片共用'))
 ok('header records that the avatar menu has no item slot', clientSource.includes('没有任何菜单项 slot'))
-ok('sidebar CSS removed', !clientSource.includes('.dtw-footbtn') && !clientSource.includes('dtw-sr'))
 
 console.log('卡片精简（详情进悬浮，不平铺）:')
 ok('tooltip carries the full rationale', clientSource.includes('"依据：" + row.why') && clientSource.includes('"生效条件：" + row.appliesWhen') && clientSource.includes('"生效方式：" + row.effect'))
 ok('tooltip carries enabled + subject + status', clientSource.includes('"当前：已启用"') && clientSource.includes('"对象状态：" + row.subjectStatusLabel'))
 ok('card body renders only title + what', clientSource.includes('className: "dtw-title"') && clientSource.includes('className: "dtw-what"'))
-ok('card meta shows only subject + status chips', clientSource.includes('dtw-meta') && !clientSource.includes('label: "启用："'))
-ok('long why is no longer a permanent block', !/className: "dtw-why"/.test(clientSource))
+ok('card meta shows only subject + status chips', clientSource.includes('dtw-meta'))
 ok('errors still surface as a line', clientSource.includes('dtw-note-error'))
 
-console.log('client static discipline:')
-ok('does not observe class', !/attributeFilter:\s*\[\s*["']class["']/.test(clientSource))
-ok('narrow attributeFilter only', /attributeFilter:\s*\[\s*"aria-expanded",\s*"aria-label"\s*\]/.test(clientSource))
-const onMutationsBody = clientSource.slice(
-  clientSource.indexOf('function onMutations'),
-  clientSource.indexOf('function armRefresh'),
-)
-ok('mutation callback inspects no whole document', onMutationsBody.length > 0 && !/document\.querySelectorAll/.test(onMutationsBody))
-ok('mutation callback only queues added subtrees', /schedule\(rec\.addedNodes\[j\]\)/.test(onMutationsBody))
-ok('uses rAF coalescing', /requestAnimationFrame/.test(clientSource))
-ok('per-node idempotency via WeakMap', /new WeakMap\(\)/.test(clientSource))
+console.log('client static discipline (no dsh-tap DOM probing):')
+ok('no MutationObserver (no in-place row to install)', !/new MutationObserver/.test(clientSource))
+ok('no dsh-tap anchor selectors', !/cbc-group-title/.test(clientSource) && !/cbc-unroutable/.test(clientSource))
+ok('no hide-unroutable CSS', !/cbc-listrow/.test(clientSource))
+ok('no balance widget', !/installBalanceWidget/.test(clientSource) && !/BALANCE_CSS/.test(clientSource))
+ok('no group subgroup machinery', !/groupByField/.test(clientSource) && !/SUBGROUP_LABEL/.test(clientSource))
 
 console.log('client no dead requests / no hardcoded refresh:')
-ok('does not POST the unregistered /diag route', !clientSource.includes('/dsh-tweaks/diag'))
-ok('does not ship diag counters', !/diag\.(sweeps|inserts|toggles)/.test(clientSource))
 ok('refresh interval comes from the host status route', /state\.refreshMs/.test(clientSource) && /config\.statusRefreshMs/.test(clientSource))
-ok('no hardcoded 600000 timer', !/setInterval\([^)]*,\s*REFRESH_MS\)/.test(clientSource))
 ok('client still declares the slots service', clientSource.includes('inject = ["slots"]'))
 
 console.log('回归：点开关后列表不能消失（transient /status 失败必须保留旧数据）:')
-// 根因：宿主写 ③ 会重载插件，/status 短暂失败；如果把 rows 置空，整张列表会瞬间消失。
 ok('transient failure keeps rows (no rows: [])', !/\.catch\(function \(\) \{\s*\n\s*state = \{ rows: \[\]/.test(clientSource))
 ok('transient failure marks stale instead', /stale: true/.test(clientSource) && /rows: state\.rows \|\| \[\]/.test(clientSource))
 ok('toggle failure keeps the list', /lastError: String/.test(clientSource) && /rows: state\.rows \|\| \[\]/.test(clientSource))
 ok('page shows a stale banner', clientSource.includes('宿主正在重载'))
 ok('page shows the last operation error', clientSource.includes('上一次操作失败'))
-ok('stale/lastError cleared by a good fetch', !/return \{ rows: rows, loaded: true, hideUnroutable: hideUnroutable, refreshMs: refreshMs, stale/.test(clientSource))
-// hmr 实际要约 2s 才落地；固定 600ms 会读到半应用状态。
-ok('toggle waits for the value to actually apply', clientSource.includes('function waitForApplied'))
-ok('does not sleep a fixed 600ms before refresh', !/setTimeout\(resolve, 600\)/.test(clientSource))
-ok('waitForApplied tolerates a reloading host', /宿主正在重载：稍等再试/.test(clientSource))
 
-console.log('回归：宿主服务状态必须现查，不能被启动时的 error 钉死:')
-// 事故：sidebarBalance 在 apply 时 deepseekAccount 还没组合，记下 error；
-// 之后服务起来了，但 describeSubject 先判 state.error，导致永久 mismatch。
-const hostTweak = TWEAKS.find((t) => t.subject && t.subject.kind === 'host')
-check('host kind exists in the registry', Boolean(hostTweak), true)
-check(
-  'live service presence wins over a stale error',
-  describeSubject(hostTweak, undefined, true, { ok: false, error: 'stale' }, true).status,
-  'ready',
-)
-check(
-  'missing service still reports missing',
-  describeSubject(hostTweak, undefined, true, { ok: false, error: 'stale' }, false).status,
-  'missing',
-)
-ok(
-  'host kind ignores the stale error text',
-  !String(describeSubject(hostTweak, undefined, true, { ok: false, error: 'stale' }, true).label).includes('stale'),
-)
-ok('apply no longer records a startup verdict for no-target tweaks', !hostSource.includes("'deepseekAccount 服务不在（dsh-deepseek-account-platform 未组合）'"))
-
-console.log('回归：toggle 的返回语义（值已相同 ≠ 失败）:')
-ok('helper separates "already set" from "key missing"', hostSource.includes('function tweakIsPresentInPatch'))
-check('tweak 存在 -> present', tweakIsPresentInPatch(patchText, 'restartButton'), true)
-check('tweak 不存在 -> absent', tweakIsPresentInPatch(patchText, 'noSuchTweak'), false)
-check('id 只匹配整键，不做子串', tweakIsPresentInPatch(patchText, 'restart'), false)
-ok('route reports unchanged instead of an error', hostSource.includes('unchanged: true'))
-ok('route still errors for a genuinely missing key', hostSource.includes('③ 里没有这个键，切不了'))
-
-console.log('回归：按归属对象分组（owner，含二级组）:')
-ok('groups by owner, not by subject kind', clientSource.includes('function groupRows(rows)') && /r\.ownerName \|\| "other"/.test(clientSource))
+console.log('回归：按归属对象分组（owner）:')
+ok('groups by owner', clientSource.includes('function groupRows(rows)') && /r\.ownerName \|\| "other"/.test(clientSource))
 ok('owner order puts DSH first', /OWNER_ORDER = \["dsh"\]/.test(clientSource))
 ok('renders a group header', clientSource.includes('function GroupHeader'))
 ok('group header summarises enabled count', clientSource.includes('已启用'))
 ok('group header flags abnormal objects', clientSource.includes('项异常'))
-ok('has secondary grouping inside an owner', clientSource.includes('function groupByField') && /groupByField\(g\.rows, "group"\)/.test(clientSource))
-ok('secondary header only when labelled', clientSource.includes('function SubGroupHeader') && /SUBGROUP_LABEL\[sub\.key\]/.test(clientSource))
 ok('groups wrap the cards', /React\.createElement\(GroupHeader/.test(clientSource))
 
-console.log('回归：dsh-tap 的两个开关同组:')
-// 关键：过滤模型是 kind=plugin，修假告警是 kind=file，但 owner 都是 dsh-tap。
-const tapOwner = TWEAKS.filter((t) => t.owner && t.owner.name === 'dsh-tap')
-check('two tweaks belong to dsh-tap', tapOwner.length, 2)
-check('their subject kinds differ', [...new Set(tapOwner.map((t) => t.subject.kind))].sort(), ['file', 'plugin'])
-check('but their owner is the same', [...new Set(tapOwner.map((t) => t.owner.name))], ['dsh-tap'])
-check('the file patch is in the patch subgroup', TWEAKS.find((t) => t.id === 'fixTapWebPin').group, 'patch')
-check('the model filter is not in a subgroup', TWEAKS.find((t) => t.id === 'hideUnroutableModels').group, undefined)
-check('DSH-owned tweaks exist', TWEAKS.filter((t) => t.owner && t.owner.name === 'dsh').length, 2)
-ok('every tweak declares an owner', TWEAKS.every((t) => t.owner && t.owner.name && t.owner.label))
-
 console.log('回归：标题文案:')
-check('model filter renamed', TWEAKS.find((t) => t.id === 'hideUnroutableModels').title, '过滤不可路由模型')
-ok('title says it is a filter/option', /过滤/.test(TWEAKS.find((t) => t.id === 'hideUnroutableModels').title))
-ok('in-page row uses the same wording', clientSource.includes('过滤不可路由模型'))
+check('hideBuiltinDeepseek title', TWEAKS.find((t) => t.id === 'hideBuiltinDeepseek').title, '隐藏内置供应商')
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exitCode = fail === 0 ? 0 : 1

@@ -1,15 +1,13 @@
-# dsh-tweaks — 一组可单独开关的小改动
+# dsh-tweaks — 增强补丁
 #
 # 把一个包插进 profile 的条目列表，让 cordis 加载 index.js（宿主半：读开关、
 # 应用补丁、提供 /dsh-tweaks/status），并把浏览器半 lib/client.js 交给 web
 # 模块加载器。
 #
-# 为什么需要它：跨机器同步时，「我开了哪几个小开关」以前散在各处（有的在 ③
-# cordis.patch.yml，有的只能手改配置）。现在它们集中成下面这一块 config，
-# 随 profile 走。
-#
-# 加一个新开关 = 在 index.js 的 TWEAKS 里加一行 + 在下面加一行 enabled。
-# 不需要改脚本、不需要再发明一套机制。
+# 开关不在此文件里：每个 tweak 是 Config 的一个 .volatile() 布尔字段，
+# 由 DSH 设置窗口的「增强补丁」分区（settings.section 一级分区）编辑，
+# settings.update 写回 profile 的 config。这里只保留插件加载入口 + 少量
+# 非开关型可调参数。
 
 - insert:
     - id: dsh-tweaks
@@ -17,25 +15,8 @@
       config:
         # 只读状态路由，loopback 同源，默认开
         statusRoute: true
-        tweaks:
-          # 隐藏内置 DeepSeek 供应商，只保留「DeepSeek 账号」。
-          hideBuiltinDeepseek:
-            enabled: false
-          # 把目录里已知不可路由的死模型（glm-4.6v / kimi-k2-thinking /
-          # minimax-m2.5 / hy4-preview-x）从选择器与设置卡列表里剔掉。
-          # 走 dsh-tap 自己的 /dsh-tap/settings 路由，不写它的文件。
-          hideUnroutableModels:
-            enabled: false
-          # 给 node_modules 里的 dsh-tap 打「web 钉选」探测补丁（本机维护脚本，
-          # 改的是他人已安装产物，升级即失效；根治要报上游）。
-          fixTapWebPin:
-            enabled: false
 
         # ── 可调参数（官方约定：凡是可能因部署而异的值都要进 Config）────────
-        # 数据类改动的重试策略（等目标插件的路由注册完）。
-        dataRetry:
-          attempts: 8
-          intervalMs: 2000
         # 对账型改动被反复弹回时的重试上限。
         reassertLimit: 10
         # 兜底对账间隔（毫秒）。0 = 纯事件驱动（默认，不轮询）；

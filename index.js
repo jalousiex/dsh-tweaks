@@ -29,8 +29,7 @@
  */
 
 import z from '@deepseek-ai/schemastery'
-import YAML from 'yaml'
-import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -52,10 +51,8 @@ export const ROUTE_PREFIX = '/dsh-tweaks'
  * `subject`— WHAT the tweak acts on. `kind` picks the status check
  *            (entry / plugin / file / host); `name`/`label` are for display.
  * `owner`  — WHICH thing the switch belongs to, for grouping in the UI.
- *            Deliberately separate from `subject.kind`: patching dsh-tap's
- *            index.js has `kind: 'file'` (it is a file check) but still
- *            belongs to dsh-tap (`owner.name: 'dsh-tap'`). Grouping by
- *            `kind` would scatter one plugin's tweaks across sections.
+ *            Deliberately separate from `subject.kind` so a single component's
+ *            tweaks stay together regardless of how each is implemented.
  */
 export const TWEAKS = Object.freeze([
   {
@@ -74,96 +71,26 @@ export const TWEAKS = Object.freeze([
     appliesWhen: '该条目在当前 profile 里存在。',
     target: 'llm-deepseek',
   },
-  {
-    id: 'hideUnroutableModels',
-    title: '过滤不可路由模型',
-    what: '在模型列表里加一层过滤：把路由不通的模型藏起来，不再出现在选择器里。',
-    why:
-      '网关目录（/v3/config）里在列、但 /v2/chat/completions 恒 11102 service info not found 的条目' +
-      '（glm-4.6v / kimi-k2-thinking / minimax-m2.5 / hy4-preview-x）在 dsh-tap 里只是置灰，' +
-      '仍占着设置卡列表与对话模型选择器——选中必失败。本开关把它们从选择器里摘掉、' +
-      '设置卡里的行连空分组标题一起隐去：停用走 dsh-tap 自己的 /dsh-tap/settings 路由' +
-      '（modelSetEnabled=false，与卡片勾选同一条路径，顺带重铺宿主镜像），不写它的文件；' +
-      '开之前处于启用状态的 id 记在 ~/.dsh/.cache/dsh-tweaks/hide-unroutable.json，' +
-      '关闭时按这份清单勾回去。只在启动/开关时执行一次（不做周期对账）——' +
-      '在 dsh-tap 卡里手动勾回的条目，下次启动会被再剔一次。',
-    // 生效对象：另一个插件（dsh-tap）自己的数据。
-    subject: { kind: 'plugin', name: 'dsh-tap', label: 'dsh-tap（CodeBuddy 网关）' },
-    // 归属：dsh-tap。
-    owner: { name: 'dsh-tap', label: 'dsh-tap（CodeBuddy 网关）', kind: 'plugin' },
-    effect: '调它自己的设置路由停用死模型；设置卡里的行靠 CSS 隐去。',
-    appliesWhen: 'dsh-tap 已装且设置路由已就绪。',
-    menu: true,
-    apply: applyHideUnroutable,
-    restore: restoreHideUnroutable,
-  },
-  {
-    id: 'sidebarBalance',
-    title: '侧边栏 DSH 余额',
-    what: '侧边栏底部显示 DSH 内置账号的余额（充值 / 赠金分开，右侧带刷新）。',
-    why:
-      'DSH 内置账号的余额只在「设置 → 账号」里看得到，每次都要开面板。把它挪到侧边栏，' +
-      '与渠道余量卡片（dsh-tap-quota）并排，一眼能同时看到「平台余额」和「上游渠道余量」。' +
-      '数据走宿主服务 deepseekAccount.getBalance（与「设置 → 账号」同源，同一种口径）；' +
-      '金额是十进制字符串，**原样透传**——内置 formatBalance 用 Big 做 roundDown，' +
-      '先转 Number 会把 12.34 变成 12.339999，最后一位就漂了。充值与赠金分开显示、不相加。' +
-      '服务不在（未装 dsh-deepseek-account-platform）或未登录时整块不渲染，失败不阻塞启动。' +
-      '注意：这里**不显示** CodeBuddy/WorkBuddy 企业套餐的额度——那个数字在网页控制台的 ' +
-      'cookie 体系里，OAuth 不可达（见 dsh-tap docs/rules/quota-signals.md R-Q10，标未解）。',
-    // 生效对象：宿主内置账号服务（不是插件、不是文件）。
-    subject: { kind: 'host', name: 'deepseekAccount', label: 'DSH 内置账号服务' },
-    // 归属：DSH 自身的账号服务。
-    owner: { name: 'dsh', label: 'DeepSeek Harness', kind: 'host' },
-    effect: '读 getBalance / getState，经 /dsh-tweaks/balance 下发给浏览器半渲染。',
-    appliesWhen: 'deepseekAccount 服务已组合（dsh-deepseek-account-platform 在位）。',
-    menu: true,
-  },
-  {
-    id: 'fixTapWebPin',
-    title: '修复 dsh-tap 假告警',
-    what: '修掉 CodeBuddy 卡里常驻的「宿主漂移」假告警（本机补丁）。',
-    why:
-      '**这一项不是插件该做的事，是本机维护脚本**——它改的是 dsh-tap 已安装的产物' +
-      '（profiles\\<profile>\\node_modules\\dsh-tap\\index.js），属于技术债，登记在此只为可追溯与自动补回。' +
-      '原理：dsh-tap 0.20.0 的 webPin 对账探测 webService.searchProviderId/fetchProviderId——' +
-      '这两个实例字段在 dsh-web 的 WebRuntime 里不存在（真实值在 config volatile 字段' +
-      'searchProvider.get()/fetchProvider.get()），所以 CodeBuddy 卡的「宿主漂移」是常驻假 warn。' +
-      '开启 = 把那段坏探测原样替换成正确取值路径（幂等；已是修复版则跳过）。**重启 DSH 后生效**' +
-      '（hmr 不监听 node_modules）。重装/升级 dsh-tap 会冲掉补丁，本开关每次启动自动补回；' +
-      '若上游代码形态变了（对不上 OLD 片段），不动文件并在状态里如实报「形态不匹配」。' +
-      '根治办法是把修复报给 dsh-tap 上游，而不是长期打补丁。',
-    subject: { kind: 'file', name: 'dsh-tap/index.js', label: 'dsh-tap 的 index.js' },
-    // 归属仍是 dsh-tap：改的是它的产物，所以和「过滤不可路由模型」同组。
-    // （subject.kind 是 'file'，只影响状态检查；分组看 owner。）
-    owner: { name: 'dsh-tap', label: 'dsh-tap（CodeBuddy 网关）', kind: 'plugin' },
-    group: 'patch',
-    effect: '对该文件做幂等字符串替换。',
-    appliesWhen: '本机能找到 dsh-tap；改了需重启 DSH。',
-    menu: true,
-    apply: applyFixTapWebPin,
-    restore: restoreFixTapWebPin,
-  },
 ])
 
+/**
+ * Config schema —— **只放不在运行时切换的参数**。
+ *
+ * 开关值（每个 tweak 的 enabled）**不在这里**：它们存在插件自己的状态文件
+ * （`~/.dsh/.cache/dsh-tweaks/state.json`），切换走 `/dsh-tweaks/toggle`，
+ * 写文件后就地重跑 apply/restore。
+ *
+ * 为什么不能放 Config：profile 是 `patchReload: live`，任何 `settings.update`
+ * 写入都会让**本插件条目热重载**；条目一重载，客户端注册的 slot（含设置窗口的
+ * 「增强补丁」分区）就随之销毁重建 —— 表现就是「点一下开关，整个界面闪一下/
+ * 分区消失」。把开关移出 Config 才能让切换过程完全不碰条目生命周期。
+ *
+ * 注意：这里的字段都**不加** `.volatile()`，因此不会被投影成设置窗口的表单，
+ * 也就没有第二个写入者。
+ */
 export const Config = z.object({
-  /**
-   * 每个改动的开关。键 = 改动 id；未知键直接忽略（向前兼容）。
-   * 注意：这一 schemastery 版本的嵌套容器默认值必须是**值**而不是函数，
-   * `.default(() => ({}))` 会让「配置里没写 tweaks」直接校验失败。
-   */
-  tweaks: z.dict(z.object({
-    enabled: z.boolean().default(false),
-  })).default({}),
   /** 是否暴露状态路由（默认开；它只读且在 loopback 上）。 */
   statusRoute: z.boolean().default(true),
-  /**
-   * 数据类改动（调目标插件自己的路由）的重试策略。
-   * 上游路由尚未注册时会失败，短间隔重试若干次后如实记状态，绝不阻塞启动。
-   */
-  dataRetry: z.object({
-    attempts: z.number().default(8),
-    intervalMs: z.number().default(2000),
-  }).default({}),
   /**
    * 对账型改动的重断言上限：目标条目被反复弹回启用时，放弃并如实报
    * 「target flips back after disable」，避免无休止地改写别人的条目。
@@ -178,18 +105,53 @@ export const Config = z.object({
   statusRefreshMs: z.number().default(600000),
 })
 
-/** 从扁平的配置对象里解出某个改动的实际启用状态。 */
-export function isEnabled(config, id) {
-  const entry = config?.tweaks?.[id]
-  return entry?.enabled === true
+/** 开关状态文件位置：本机 `.cache`，不进同步盘（属一次性运行时状态）。 */
+export function statePath(dshHome) {
+  return join(dshHome || dshHomePath(), '.cache', 'dsh-tweaks', 'state.json')
+}
+
+/**
+ * 读开关状态文件。返回 `{ <tweakId>: boolean }`。
+ * 文件缺失/损坏一律当「全关」，绝不抛错（启动不能被它拖住）。
+ */
+export function readState(dshHome) {
+  try {
+    const doc = JSON.parse(readFileSync(statePath(dshHome), 'utf8'))
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return {}
+    const out = {}
+    for (const t of TWEAKS) out[t.id] = doc[t.id] === true
+    return out
+  } catch {
+    return Object.fromEntries(TWEAKS.map((t) => [t.id, false]))
+  }
+}
+
+/** 写开关状态文件（临时文件 + rename 原子替换），失败返回 false 不抛。 */
+export function writeState(dshHome, next) {
+  const file = statePath(dshHome)
+  const tmp = file + '.tmp'
+  try {
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf8')
+    renameSync(tmp, file)
+    return true
+  } catch {
+    try { rmSync(tmp, { force: true }) } catch {}
+    return false
+  }
+}
+
+/** 从状态对象里解出某个改动的实际启用状态。 */
+export function isEnabled(state, id) {
+  return state?.[id] === true
 }
 
 /** 所有已知改动及其开关状态快照，供状态路由使用。 */
-export function describeTweaks(config, applied, servicePresent) {
+export function describeTweaks(config, applied) {
   return TWEAKS.map((t) => {
     const enabled = isEnabled(config, t.id)
     const state = applied.get(t.id)
-    const subject = describeSubject(t, undefined, enabled, state, servicePresent)
+    const subject = describeSubject(t, undefined, enabled, state)
     return {
       id: t.id,
       title: t.title,
@@ -234,83 +196,6 @@ export function checkTarget(target, tree) {
     : { ok: false, present: false, reason: `target ${target} is not in the config tree` }
 }
 
-/**
- * 判断某个 tweak 键是否真的出现在 ③ 的 dsh-tweaks 段里。
- * 用来把「值已相同（改不动很正常）」和「根本没有这个键（真错）」分开——
- * `setTweakEnabledInText` 对两者的返回值都是「文本没变」。
- */
-export function tweakIsPresentInPatch(text, id) {
-  const lines = String(text).split(/\r?\n/)
-  const start = lines.findIndex((l) => /^\s*-\s*id:\s*['"]?dsh-tweaks['"]?\s*$/.test(l))
-  if (start < 0) return false
-  let end = lines.length
-  for (let i = start + 1; i < lines.length; i++) {
-    if (/^\s*-\s*id:\s*/.test(lines[i])) { end = i; break }
-  }
-  const escaped = String(id).replace(/[.*+?^${}()|[\]\\]/g, (c) => '\\' + c)
-  const keyRe = new RegExp('^\\s+' + escaped + ':\\s*(?:#.*)?$')
-  for (let i = start + 1; i < end; i++) {
-    if (keyRe.test(lines[i])) return true
-  }
-  return false
-}
-
-/**
- * 在 `cordis.patch.yml` 文本里把某个 tweak 的 `enabled` 改成目标值。
- * 纯函数，便于单测；格式对不上就原样返回（调用方据此报错，不会写坏文件）。
- */
-export function setTweakEnabledInText(text, id, enabled) {
-  const lines = String(text).split(/\r?\n/)
-  const start = lines.findIndex((l) => /^\s*-\s*id:\s*['\"]?dsh-tweaks['\"]?\s*$/.test(l))
-  if (start < 0) return text
-  let end = lines.length
-  for (let i = start + 1; i < lines.length; i++) {
-    if (/^\s*-\s*id:\s*/.test(lines[i])) { end = i; break }
-  }
-  const indentOf = (l) => (l.match(/^\s*/) || [''])[0].length
-  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, function (c) { return '\\' + c })
-  // 键、值都允许行尾注释（YAML 合法，配置里也确实这么写）——只替换布尔值，
-  // 行尾注释原样留着，否则「开关写回」会在带注释的行上失效。
-  const keyRe = new RegExp('^(\\s+)' + escaped + ':\\s*(?:#.*)?$')
-  for (let i = start; i < end; i++) {
-    const m = lines[i].match(keyRe)
-    if (!m) continue
-    const keyIndent = m[1].length
-    for (let j = i + 1; j < end; j++) {
-      if (indentOf(lines[j]) <= keyIndent && lines[j].trim()) break
-      const em = lines[j].match(/^(\s+)enabled:\s*(true|false)(\s*(?:#.*)?)$/)
-      if (em) {
-        lines[j] = em[1] + 'enabled: ' + (enabled === true ? 'true' : 'false') + em[3]
-        return lines.join('\n')
-      }
-    }
-    return text
-  }
-  return text
-}
-
-/**
- * 校验候选的 patch 文本是不是一个能解析的 YAML 文档列表。
- * 纯函数，便于单测；不修改任何文件。返回 `{ ok, error }`。
- *
- * 为什么必须有：③ 覆盖层一旦写成不可解析的 YAML，宿主下次启动会在
- * `parsePatchList` 直接抛错、整层丢失——而这层正是本插件开关的权威落点。
- * 所以 `/toggle` 落盘前必须先过这一关：宁可拒绝写入，也绝不写出坏配置。
- */
-export function validatePatchText(text) {
-  try {
-    const doc = YAML.parseDocument(String(text))
-    if (doc.errors && doc.errors.length) {
-      const first = doc.errors[0]
-      const where = first && first.pos ? ` (line ${first.pos[0] + 1})` : ''
-      return { ok: false, error: `YAML 解析失败${where}: ${first ? first.message : 'unknown'}` }
-    }
-    return { ok: true, error: null }
-  } catch (error) {
-    return { ok: false, error: `YAML 解析失败: ${String((error && error.message) || error)}` }
-  }
-}
-
 /** 取 Loader 服务（Cordis Loader 以 `loader` 名注册）。取不到返回 undefined。 */
 export function loaderOf(ctx) {
   try {
@@ -330,299 +215,6 @@ function dshHomePath() {
 // 进程、再退旧进程」会和新进程抢监听端口；③ 入口太深（插件设置页），而 dsh-restart
 // 提供 /restart 命令与 restart_harness 工具，还会记录进行中会话以便重启后续跑。
 // 现在重启一律走 dsh-restart，本插件不再碰进程生命周期。
-
-// ── 数据类改动（hideUnroutableModels）的支撑 ──────────────────────────────
-// 这类开关的效果不在 Loader 条目上（为了剔几个模型把 dsh-tap 整条禁掉是不行的），
-// 而是调目标插件自己的设置路由。所以它只在 apply/restore 里做事，状态照样进
-// /dsh-tweaks/status。
-
-/** dsh-tap 设置卡自己的路由（GET 视图 / POST 动作共用同一个入口）。 */
-export const TAP_SETTINGS_ROUTE = '/dsh-tap/settings'
-
-// ── fixTapWebPin：给 dsh-tap 的 node_modules 副本打探测补丁 ────────────────
-// 不是路由类开关，也不动 Loader 条目：效果是磁盘文件补丁（幂等）。
-// 上游升级冲掉补丁时，本开关每次启动把它补回去；restore 还原上游原样。
-
-/**
- * dsh-tap 0.20.0 的坏探测段（`dsh plugin add` 后的原始形态）。
- * 补丁按「原样字符串替换」打：片段对不上 = 形态变了 = 不动 + 如实报状态。
- */
-export const TAP_WEBPIN_OLD = `  try {
-    const sp = webService?.()?.searchProviderId
-    const fp = webService?.()?.fetchProviderId
-    if (sp !== undefined || fp !== undefined || webService?.()) {
-      out.webPin = { searchProvider: sp ?? null, fetchProvider: fp ?? null, ok: sp === 'codebuddy' && fp === 'codebuddy' }
-    }
-  } catch { out.webPin = null }`
-
-/** 补丁后的正确取值路径（与 dsh-web WebRuntime.search()/fetch() 同款）。 */
-export const TAP_WEBPIN_NEW = `  try {
-    // WebRuntime 取钉选的真实路径（search()/fetch() 同款）：config volatile 字段
-    // 现取 + env 覆盖兜底（$DSH_WEB_SEARCH_PROVIDER 优先级与 search() 内一致：
-    // config.get() ?? env）。实例上不存在 searchProviderId/fetchProviderId 字段。
-    const readPin = (field, envName) => {
-      const svc = webService?.()
-      if (!svc) return undefined
-      const getter = svc?.config?.[field]?.get
-      const configured = typeof getter === 'function' ? (() => { try { return getter.call(svc.config[field]) } catch { return undefined } })() : undefined
-      return configured ?? svc?.[field === 'searchProvider' ? 'searchProviderEnv' : 'fetchProviderEnv'] ?? process.env[envName]
-    }
-    const sp = readPin('searchProvider', 'DSH_WEB_SEARCH_PROVIDER')
-    const fp = readPin('fetchProvider', 'DSH_WEB_FETCH_PROVIDER')
-    if (sp !== undefined || fp !== undefined) {
-      out.webPin = { searchProvider: sp ?? null, fetchProvider: fp ?? null, ok: sp === 'codebuddy' && fp === 'codebuddy' }
-    }
-  } catch { out.webPin = null }`
-
-/**
- * dsh-tap 的 node_modules 部署位置：`<DSH_HOME>\profiles\<profile>\node_modules\dsh-tap\index.js`。
- * profile 目录名不硬编码——扫描 profiles\ 下带 node_modules\dsh-tap 的那个。
- */
-export function tapIndexPath(dshHome) {
-  const home = dshHome || dshHomePath()
-  const profilesDir = join(home, 'profiles')
-  let candidates = []
-  try {
-    candidates = readdirSync(profilesDir).filter((name) => {
-      try { return statSync(join(profilesDir, name)).isDirectory() } catch { return false }
-    })
-  } catch {
-    return null
-  }
-  for (const name of candidates) {
-    const hit = join(profilesDir, name, 'node_modules', 'dsh-tap', 'index.js')
-    try {
-      if (statSync(hit).isFile()) return hit
-    } catch {}
-  }
-  return null
-}
-
-/**
- * 纯函数（便于单测）：对 dsh-tap index.js 文本打/撤 webPin 补丁。
- * 返回 `{ text, state }`；state ∈ 'patched'（已打上）| 'upstream'（已还原）| 'unknown'（形态对不上，原样返回）。
- */
-export function patchTapWebPinText(text, apply_) {
-  const hasOld = text.includes(TAP_WEBPIN_OLD)
-  const hasNew = text.includes(TAP_WEBPIN_NEW)
-  if (apply_) {
-    if (hasNew) return { text, state: 'patched' }
-    if (!hasOld) return { text, state: 'unknown' }
-    return { text: text.split(TAP_WEBPIN_OLD).join(TAP_WEBPIN_NEW), state: 'patched' }
-  }
-  if (hasOld) return { text, state: 'upstream' }
-  if (!hasNew) return { text, state: 'unknown' }
-  return { text: text.split(TAP_WEBPIN_NEW).join(TAP_WEBPIN_OLD), state: 'upstream' }
-}
-
-/** fixTapWebPin 的「开」：把补丁写进 dsh-tap 的 index.js（已是修复版则不写）。 */
-export async function applyFixTapWebPin({ dshHome } = {}) {
-  const file = tapIndexPath(dshHome)
-  if (!file) throw new Error('找不到 dsh-tap 的 node_modules 部署（profiles\\*\\node_modules\\dsh-tap\\index.js）')
-  const before = readFileSync(file, 'utf8')
-  const { text, state } = patchTapWebPinText(before, true)
-  if (state === 'unknown') return { state, file, note: '上游代码形态变了，补丁对不上——未改动文件' }
-  if (text !== before) writeFileSync(file, text, 'utf8')
-  return { state, file, note: state === 'patched' && text !== before ? '已打补丁（重启 DSH 生效）' : '补丁已在位' }
-}
-
-/** fixTapWebPin 的「关」：还原 dsh-tap 上游原样（已是原样则不写）。 */
-export async function restoreFixTapWebPin({ dshHome } = {}) {
-  const file = tapIndexPath(dshHome)
-  if (!file) throw new Error('找不到 dsh-tap 的 node_modules 部署（profiles\\*\\node_modules\\dsh-tap\\index.js）')
-  const before = readFileSync(file, 'utf8')
-  const { text, state } = patchTapWebPinText(before, false)
-  if (state === 'unknown') return { state, file, note: '既非上游原样也非已知补丁形态——未改动文件' }
-  if (text !== before) writeFileSync(file, text, 'utf8')
-  return { state, file, note: state === 'upstream' && text !== before ? '已还原上游原样（重启 DSH 生效）' : '上游原样已在位' }
-}
-
-// ── sidebarBalance：把 DSH 内置账号余额搬到侧边栏 ───────────────────────
-// 数据源是宿主服务 deepseekAccount（与「设置 → 账号」同源）。只读，不碰凭据：
-// getBalance 只要一份 ClientMetadata（version/locale/timezoneOffsetSeconds），
-// 它只被拼成 Platform 的 x-client-* 标识头，不参与鉴权。
-
-/** Platform 只取语言主标签（zh → zh_CN），宿主用 ICU 的默认区域即可。 */
-export function hostLocale() {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().locale || 'en-US'
-  } catch {
-    return 'en-US'
-  }
-}
-
-/** getBalance 的调用方标识：东八区为 +28800。与内置 accountClientMetadata 同口径。 */
-export function accountClientMetadata() {
-  return {
-    version: process.env.DSH_CLIENT_VERSION || process.env.DSH_VERSION || '0.0.0',
-    locale: hostLocale(),
-    timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
-  }
-}
-
-/**
- * 归一化余额：`value` = 充值余额，`bonusWallets` = 赠金余额，**分开、不相加**。
- * 金额是十进制字符串，原样保留（浏览器端按同一套字符串截断规则格式化）。
- * 只收 CNY/USD；非字符串余额一律丢弃——不猜、不转 Number。
- */
-export function normalizeBalance(balance) {
-  if (balance === null || balance === undefined) return { ok: false, error: 'signed-out', wallets: [], bonusWallets: [] }
-  if (balance.status !== 'ready') return { ok: false, error: 'read-failed', wallets: [], bonusWallets: [] }
-  const pick = (list) =>
-    (Array.isArray(list) ? list : [])
-      .filter((w) => w && typeof w.balance === 'string' && (w.currency === 'CNY' || w.currency === 'USD'))
-      .map((w) => ({ currency: w.currency, balance: w.balance }))
-  return { ok: true, wallets: pick(balance.value), bonusWallets: pick(balance.bonusWallets) }
-}
-
-/**
- * 读一次余额 + 登录态。两个读**各自**超时兜底：余额慢不该把登录态也拖没（反之亦然）。
- * 服务不在返回 null（调用方据此决定不渲染 / 报 missing）。
- */
-export async function readBalance(service, timeoutMs = 6000) {
-  if (!service) return null
-  const TIMEOUT = Symbol('balance-timeout')
-  const guarded = (promise) => {
-    let timer = null
-    return Promise.race([
-      promise,
-      new Promise((resolve) => {
-        timer = setTimeout(() => resolve(TIMEOUT), timeoutMs)
-      }),
-    ]).finally(() => {
-      if (timer) clearTimeout(timer)
-    })
-  }
-  const [state, balance] = await Promise.all([
-    typeof service.getState === 'function' ? guarded(service.getState()).catch(() => null) : Promise.resolve(null),
-    // 读失败与「未登录」是两件事：null 会被 normalizeBalance 判成 signed-out，
-    // 那是误报。失败时显式给 failed，让它如实落到 read-failed。
-    typeof service.getBalance === 'function'
-      ? guarded(service.getBalance(accountClientMetadata())).catch(() => ({ status: 'failed' }))
-      : Promise.resolve(undefined),
-  ])
-  return {
-    signedIn: state?.status === 'credential-stored',
-    // 服务没有 getBalance（undefined）= 未登录；调用过但失败 = read-failed。
-    balance: balance === undefined ? normalizeBalance(null) : normalizeBalance(balance),
-  }
-}
-
-/** 「开之前是启用的」id 清单落盘位置（.cache 不进同步盘，属本机一次性状态）。 */
-function hideUnroutableStatePath() {
-  return join(dshHomePath(), '.cache', 'dsh-tweaks', 'hide-unroutable.json')
-}
-
-/**
- * 从 dsh-tap 的 model-list 视图里取出「目录在列、但 /v2 恒 11102」的模型 id。
- * 纯函数（便于单测）。目录里已经消失的历史 id 不算——上游删了就没必要再动它。
- */
-export function unroutableIds(view) {
-  const models = view && view.catalog && Array.isArray(view.catalog.models) ? view.catalog.models : []
-  const present = new Set()
-  for (const m of models) if (m && typeof m.id === 'string' && m.id) present.add(m.id)
-  const table = view && view.unroutable && typeof view.unroutable === 'object' ? view.unroutable : {}
-  return Object.keys(table).filter((id) => present.has(id))
-}
-
-function readRestoreIds(file) {
-  try {
-    const doc = JSON.parse(readFileSync(file, 'utf8'))
-    return Array.isArray(doc && doc.ids) ? doc.ids.filter((id) => typeof id === 'string' && id) : []
-  } catch {
-    return []
-  }
-}
-
-function writeRestoreIds(file, ids) {
-  if (!ids.length) return
-  mkdirSync(dirname(file), { recursive: true })
-  writeFileSync(file, JSON.stringify({ ids }, null, 2), 'utf8')
-}
-
-function clearRestoreIds(file) {
-  try { rmSync(file, { force: true }) } catch {}
-}
-
-/**
- * POST 到 dsh-tap 的设置路由。宿主发起 = 没有 Origin 头，正好落在它
- * 「壳转发/非浏览器放行」的语义里（它的 localGuardFailure 只要求回环 Host）。
- * 任何非 200 / 非 JSON / ok:false 都抛错，由调用方记进状态。
- */
-async function tapPost(origin, body) {
-  if (!origin) throw new Error('取不到本机 webServer origin')
-  const url = String(origin).replace(/\/+$/, '') + TAP_SETTINGS_ROUTE
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  const text = await response.text()
-  let doc = null
-  try { doc = JSON.parse(text) } catch { doc = null }
-  if (!response.ok) {
-    throw new Error(`dsh-tap ${response.status}${doc && doc.error ? '：' + doc.error : ''}`)
-  }
-  if (!doc) throw new Error('dsh-tap 返回的不是 JSON（路由可能还没注册）')
-  if (doc.ok === false) throw new Error(String(doc.error || 'dsh-tap 拒绝了请求'))
-  return doc
-}
-
-/**
- * hideUnroutableModels 的「开」：把目录里已知不可路由的模型逐个停用。
- * 停用走 dsh-tap 自己的 modelSetEnabled（与卡片勾选同一条路径，它会顺带
- * 重铺宿主镜像，选择器立刻跟上），不写它的文件。开之前处于启用状态的 id
- * 记进还原清单，供关闭时勾回。
- */
-export async function applyHideUnroutable({ origin, stateFile }) {
-  const view = await tapPost(origin, { action: 'model-list' })
-  const ids = unroutableIds(view)
-  const effective = new Set(Array.isArray(view.effectiveIds) ? view.effectiveIds : [])
-  const live = ids.filter((id) => effective.has(id))
-  if (live.length) {
-    const keep = readRestoreIds(stateFile)
-    for (const id of live) if (!keep.includes(id)) keep.push(id)
-    writeRestoreIds(stateFile, keep)
-    for (const id of live) {
-      await tapPost(origin, { patch: { modelSetEnabled: { id, enabled: false } } })
-    }
-  }
-  const models = view.catalog && Array.isArray(view.catalog.models) ? view.catalog.models : []
-  return { ids, disabledNow: live, catalogCount: models.length }
-}
-
-/** hideUnroutableModels 的「关」：按还原清单把当初启用的模型勾回去。 */
-export async function restoreHideUnroutable({ origin, stateFile }) {
-  const ids = readRestoreIds(stateFile)
-  if (!ids.length) return { restored: [], failed: [] }
-  const restored = []
-  const failed = []
-  for (const id of ids) {
-    try {
-      await tapPost(origin, { patch: { modelSetEnabled: { id, enabled: true } } })
-      restored.push(id)
-    } catch (error) {
-      // 目录里已经消失、且不在静态清单里的 id 会在这里失败（dsh-tap 要 profile
-      // 才能启用新增模型）——记下来继续，别让一个死 id 挡住其它还原。
-      failed.push({ id, error: String((error && error.message) || error) })
-    }
-  }
-  if (!failed.length) clearRestoreIds(stateFile)
-  return { restored, failed }
-}
-
-/** 数据类改动的结果 → 状态路由里一句人话（null = 不写）。结果自带 note 时优先用它。 */
-function describeDataResult(enabled, result) {
-  if (result && typeof result.note === 'string') return result.note
-  if (!enabled) {
-    const restored = Array.isArray(result && result.restored) ? result.restored : []
-    const failed = Array.isArray(result && result.failed) ? result.failed : []
-    if (!restored.length && !failed.length) return '没有需要还原的条目'
-    return `还原 ${restored.length} 个${failed.length ? `（${failed.length} 个失败）` : ''}`
-  }
-  const ids = Array.isArray(result && result.disabledNow) ? result.disabledNow : []
-  return ids.length ? `已从选择器移除 ${ids.length} 个：${ids.join(', ')}` : '没有需要移除的条目'
-}
 
 function readRequestBody(req) {
   return new Promise((resolve) => {
@@ -683,46 +275,22 @@ function nonNegativeInt(value, fallback) {
  *
  * 返回 `{ status, label }`，status ∈
  *   `idle`       开关没开（谈不上生效对象的状态）
- *   `ready`      就绪（对象在位、可用）
- *   `pending`    对象在位，但效果还没落上去
- *   `disabled`   对象在位但已被本开关禁用（条目类改动的稳态）
- *   `missing`    对象不在（插件没装 / 条目不在 Loader 树里）
- *   `mismatch`   对象在，但形态对不上（例如补丁片段不匹配）
+ *   `disabled`   条目在位且已被本开关禁用（条目类改动的稳态）
+ *   `pending`    条目在位，但尚未禁用
+ *   `missing`    条目不在 Loader 树里
+ *   `mismatch`   条目在，但状态异常
  *
  * 注意：它只看「此刻的事实」，不猜。拿不准就报 missing 并把原因写进 label。
  */
-export function describeSubject(tweak, entry, enabled, state, servicePresent) {
+export function describeSubject(tweak, entry, enabled, state) {
   if (!enabled) return { status: 'idle', label: '未启用' }
-
-  const kind = tweak.subject && tweak.subject.kind
-
-  // `host` 类对象可以用「此刻服务在不在」直接判定，这个结论比任何
-  // 启动时记下的 error 都新——所以先判它，避免一条过期的 error
-  // 把「其实好好的」永久盖成 mismatch（sidebarBalance 就这么错过）。
-  if (kind === 'host') {
-    return servicePresent === true
-      ? { status: 'ready', label: '宿主服务在位' }
-      : { status: 'missing', label: `取不到 ${tweak.subject?.name || '宿主服务'}（未组合或不可用）` }
-  }
 
   if (state && state.error) return { status: 'mismatch', label: `对象在，但状态异常：${state.error}` }
 
-  switch (kind) {
-    case 'entry':
-      if (!entry) return { status: 'missing', label: '条目不在当前 Loader 树里（插件可能被移除或改名）' }
-      return entry.disabled === true
-        ? { status: 'disabled', label: '条目在位，已被本开关禁用' }
-        : { status: 'pending', label: '条目在位，但尚未禁用' }
-    case 'plugin':
-      return state && state.ok
-        ? { status: 'ready', label: '插件在位，它的设置路由可用' }
-        : { status: 'missing', label: '插件或其设置路由不可用（没装 / 还没起来）' }
-    case 'file':
-      if (!tapIndexPath()) return { status: 'missing', label: '找不到 dsh-tap 的 node_modules 部署' }
-      return { status: 'ready', label: '文件在位（改完需重启 DSH 生效）' }
-    default:
-      return { status: 'unknown', label: '未声明生效对象' }
-  }
+  if (!entry) return { status: 'missing', label: '条目不在当前 Loader 树里（插件可能被移除或改名）' }
+  return entry.disabled === true
+    ? { status: 'disabled', label: '条目在位，已被本开关禁用' }
+    : { status: 'pending', label: '条目在位，但尚未禁用' }
 }
 
 export function apply(ctx, config = {}) {
@@ -730,91 +298,42 @@ export function apply(ctx, config = {}) {
   const applied = new Map()
 
   /**
+   * 开关状态（活值）。从自己的状态文件读，切换时**原地改这个对象**，
+   * 不碰 Config / profile patch —— 因此不会触发本插件条目热重载，
+   * 客户端注册的 slot 也不会被销毁重建。
+   */
+  let switches = readState()
+  /** 每个 tweak 已注册的 effect 的 disposer（切换时先撤销再按新状态重建）。 */
+  const disposers = new Map()
+
+  /**
    * 配置值兜底：schema 已经给了默认值，但 `apply` 也可能被裸调用（单测 /
    * 旧宿主），所以这里再兜一层，保证下面的算术不会拿到 undefined。
    */
-  const retry = {
-    attempts: positiveInt(config?.dataRetry?.attempts, 8),
-    intervalMs: nonNegativeInt(config?.dataRetry?.intervalMs, 2000),
-  }
   const reassertLimit = positiveInt(config?.reassertLimit, 10)
   const fallbackMs = nonNegativeInt(config?.fallbackReconcileMs, 0)
   const statusRefreshMs = positiveInt(config?.statusRefreshMs, 600000)
 
-  /**
-   * 数据类改动：效果不在 Loader 条目上，而是调目标插件自己的设置路由。
-   * 要等 webServer 起来、且兄弟插件的路由注册完，失败就短暂重试；
-   * 重试耗尽也只记状态，绝不阻塞启动（规则 4）。
-   */
-  function runDataTweak(tweak, enabled) {
-    ctx.inject(['webServer'], (wsctx) => {
-      wsctx.effect(() => {
-        let cancelled = false
-        const timers = new Set()
-        const origin = () => {
-          try { return wsctx.webServer.getOrigin() } catch { return undefined }
-        }
-        const attempt = async (left) => {
-          if (cancelled) return
-          try {
-            const result = enabled
-              ? await tweak.apply({ origin: origin(), stateFile: hideUnroutableStatePath() })
-              : await tweak.restore({ origin: origin(), stateFile: hideUnroutableStatePath() })
-            applied.set(tweak.id, { ok: true, error: null, note: describeDataResult(enabled, result) })
-          } catch (error) {
-            const message = String((error && error.message) || error)
-            if (left > 1) {
-              const timer = setTimeout(() => { timers.delete(timer); attempt(left - 1) }, retry.intervalMs)
-              timers.add(timer)
-              return
-            }
-            applied.set(tweak.id, { ok: false, error: message })
-          }
-        }
-        attempt(retry.attempts)
-        return () => {
-          cancelled = true
-          for (const timer of timers) clearTimeout(timer)
-          timers.clear()
-        }
-      }, `dsh-tweaks:${tweak.id}:data`)
-    })
-  }
-
-  /** deepseekAccount 服务在不在（sidebarBalance 的生效对象）。 */
-  function accountServicePresent() {
-    try {
-      return Boolean(ctx.get('deepseekAccount'))
-    } catch {
-      return false
+  /** 撤掉某个 tweak 已注册的副作用（若在），供就地重跑前清理。 */
+  function disposeTweak(id) {
+    const off = disposers.get(id)
+    disposers.delete(id)
+    if (typeof off === 'function') {
+      try { off() } catch {}
     }
   }
 
   function runTweak(tweak) {
-    const enabled = isEnabled(config, tweak.id)
+    const enabled = isEnabled(switches, tweak.id)
     if (!enabled) {
       applied.delete(tweak.id)
-      // 数据类改动在关闭时也要跑一次：把开之前启用的条目还回去。
-      if (typeof tweak.restore === 'function') runDataTweak(tweak, false)
-      return
-    }
-    if (typeof tweak.apply === 'function') {
-      applied.set(tweak.id, { ok: false, error: '尚未应用（等待 dsh-tap 路由）' })
-      runDataTweak(tweak, true)
-      return
-    }
-    if (!tweak.target) {
-      // 无 target 的改动（如 sidebarBalance）没有条目可收敛，效果由它自己的
-      // 路由兑现。这里**不**判「生效对象在不在」——服务可能在 apply 之后才组合
-      // （插件加载顺序不定），那会让一条过期的结论永久钉在状态里。
-      // 「对象在不在」交给 /status 的 describeSubject() 现查现报。
-      applied.set(tweak.id, { ok: true, error: null })
       return
     }
     try {
       // ctx.effect 注册的是可逆副作用：cordis 在卸载/禁用时会调用清理回调，
-      // 这正是它能在运行时安全开关的原因。
-      ctx.effect(() => {
+      // 这正是它能在运行时安全开关的原因。disposer 存进 disposers，
+      // 供 /toggle 就地重跑时先撤销。
+      const off = ctx.effect(() => {
         let cancelled = false
         let reasserts = 0
         let touched = false
@@ -861,6 +380,7 @@ export function apply(ctx, config = {}) {
           if (touched) restoreEntry(findEntry(loaderOf(ctx), tweak.target), undefined)
         }
       }, `dsh-tweaks:${tweak.id}`)
+      if (typeof off === 'function') disposers.set(tweak.id, off)
       applied.set(tweak.id, { ok: true, error: null })
     } catch (error) {
       // 规则 4：绝不阻塞启动。记录下来继续。
@@ -872,6 +392,19 @@ export function apply(ctx, config = {}) {
     for (const tweak of TWEAKS) runTweak(tweak)
   }
 
+  /**
+   * 就地重跑全部 tweak：先撤销已注册的副作用，再按当前 `switches` 重建。
+   *
+   * /toggle 走这里而不是 `settings.update` —— 后者会写 profile patch 并触发
+   * 本插件条目热重载（客户端 slot 随之闪断/消失）。这里只动进程内副作用，
+   * 客户端完全感知不到界面被重建。
+   */
+  function reconcileAll() {
+    for (const tweak of TWEAKS) disposeTweak(tweak.id)
+    applied.clear()
+    applyAll()
+  }
+
   /** 每个改动：配置值 / 是否应用成功 / 目标条目此刻是否真的禁用。 */
   function status() {
     const loader = loaderOf(ctx)
@@ -881,9 +414,9 @@ export function apply(ctx, config = {}) {
       tweaks: TWEAKS.map((tweak) => {
         const entry = tweak.target ? findEntry(loader, tweak.target) : undefined
         const state = applied.get(tweak.id)
-        const enabled = isEnabled(config, tweak.id)
+        const enabled = isEnabled(switches, tweak.id)
         // 「对象状态」：这个改动赖以生效的对象此刻是什么状况。
-        const subject = describeSubject(tweak, entry, enabled, state, accountServicePresent())
+        const subject = describeSubject(tweak, entry, enabled, state)
         return {
           id: tweak.id,
           title: tweak.title,
@@ -904,7 +437,7 @@ export function apply(ctx, config = {}) {
           subject: tweak.subject || null,
           subjectKind: (tweak.subject && tweak.subject.kind) || null,
           subjectLabel: (tweak.subject && tweak.subject.label) || null,
-          // 归属（分组用）：与 subject.kind 分开——改 dsh-tap 的文件仍归 dsh-tap。
+          // 归属（分组用）：标识这条补丁属于哪个组件。
           owner: tweak.owner || null,
           ownerName: (tweak.owner && tweak.owner.name) || null,
           ownerLabel: (tweak.owner && tweak.owner.label) || null,
@@ -934,8 +467,14 @@ export function apply(ctx, config = {}) {
           response.end(JSON.stringify(status()))
         },
       }), 'dsh-tweaks:status-route')
-      // 界面开关：把 enabled 写回 ③ 的 dsh-tweaks 段。
-      // 写 ③ 而不是 ②：③ 是覆盖层，配置放在 ③ 才不会被覆盖。
+      /**
+       * 开关切换：写插件自己的状态文件 + **就地重跑**，全程不碰 Config / patch 层。
+       *
+       * 为什么不用 settings.update：它写 profile patch，而 profile 是
+       * `patchReload: live` —— 一次写入就让本插件条目热重载，客户端注册的
+       * slot（设置窗口的「增强补丁」分区）随之销毁重建，表现就是「点一下开关，
+       * 右边内容整个消失」。写自己的文件 + 进程内 reconcile 完全不触发那条链。
+       */
       wsctx.effect(() => wsctx.webServer.register({
         kind: 'exact',
         path: `${ROUTE_PREFIX}/toggle`,
@@ -944,79 +483,21 @@ export function apply(ctx, config = {}) {
             const raw = await readRequestBody(request)
             const body = JSON.parse(raw || '{}')
             if (!TWEAKS.some((t) => t.id === body.id)) throw new Error('unknown tweak: ' + body.id)
-            const file = join(dshHomePath(), 'cordis.patch.yml')
-            const before = readFileSync(file, 'utf8')
-            const want = body.enabled === true
-            const after = setTweakEnabledInText(before, body.id, want)
-            if (after === before) {
-              // 文本没变有两种原因，必须分开报——原来一律报「不在段里」，
-              // 于是「值已经就是这个」也被当成失败，用户以为开关坏了。
-              const present = tweakIsPresentInPatch(before, body.id)
-              if (!present) {
-                throw new Error(`tweak ${body.id} 不在 ${file} 的 dsh-tweaks 段里（③ 里没有这个键，切不了）`)
-              }
-              // 已经是目标值：幂等成功，不写盘。
-              response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-              response.end(JSON.stringify({ ok: true, id: body.id, enabled: want, file, unchanged: true }))
-              return undefined
-            }
-            // 落盘前必须过 YAML 这一关：③ 一旦写成不可解析的文档，宿主下次
-            // 启动会在 parsePatchList 直接抛错、整层丢失（= 所有开关失效）。
-            // 宁可不写，也绝不把坏配置写进权威层。
-            const parsedBefore = validatePatchText(before)
-            const parsedAfter = validatePatchText(after)
-            if (!parsedBefore.ok) {
-              throw new Error(file + ' 当前就不可解析，先修好它再切开关：' + parsedBefore.error)
-            }
-            if (!parsedAfter.ok) throw new Error('改写结果不可解析，已放弃写入：' + parsedAfter.error)
-            writeFileSync(file, after, 'utf8')
+            const enabled = body.enabled === true
+            // 1) 落盘（原子写；失败要如实报，不能假装成功）
+            const next = { ...switches, [body.id]: enabled }
+            if (!writeState(undefined, next)) throw new Error('开关状态写入失败（检查 ~/.dsh/.cache 是否可写）')
+            // 2) 更新活值并就地重跑（不触发条目重载）
+            switches = next
+            reconcileAll()
             response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-            response.end(JSON.stringify({ ok: true, id: body.id, enabled: body.enabled === true, file }))
+            response.end(JSON.stringify({ ok: true, id: body.id, enabled }))
           } catch (error) {
             response.writeHead(400, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
             response.end(JSON.stringify({ ok: false, error: String((error && error.message) || error) }))
           }
         },
       }), 'dsh-tweaks:toggle-route')
-
-      /**
-       * sidebarBalance 的数据源：DSH 内置账号余额。
-       *
-       * 实时读（带 10s 缓存吸收同一次轮询里的连点）。带 6s 硬性上限：
-       * 浏览器端 fetch 超时是 8s，绝不能反过来挂住它。
-       * 任何异常都转成可解析的 JSON，绝不抛进响应（否则浏览器端当成网络错误并退避）。
-       */
-      let balanceCache = { at: 0, value: null }
-      const BALANCE_CACHE_MS = 10000
-      wsctx.effect(() => wsctx.webServer.register({
-        kind: 'exact',
-        path: `${ROUTE_PREFIX}/balance`,
-        handler: async (request, response) => {
-          const send = (payload) => {
-            response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-            response.end(JSON.stringify(payload))
-          }
-          try {
-            const url = new URL(request.url ?? '/', 'http://127.0.0.1')
-            const force = url.searchParams.get('refresh') === '1'
-            if (!force && balanceCache.value && Date.now() - balanceCache.at < BALANCE_CACHE_MS) {
-              return send(balanceCache.value)
-            }
-            const service = ctx.get('deepseekAccount')
-            if (!service) {
-              return send({ ok: false, at: Date.now(), signedIn: false, balance: null, reason: 'service-absent' })
-            }
-            const read = await readBalance(service, 6000)
-            const payload = read
-              ? { ok: true, at: Date.now(), signedIn: read.signedIn, balance: read.balance }
-              : { ok: false, at: Date.now(), signedIn: false, balance: null, reason: 'read-failed' }
-            if (payload.ok) balanceCache = { at: Date.now(), value: payload }
-            send(payload)
-          } catch (error) {
-            send({ ok: false, at: Date.now(), signedIn: false, balance: null, reason: String((error && error.message) || error) })
-          }
-        },
-      }), 'dsh-tweaks:balance-route')
 
     })
   }
